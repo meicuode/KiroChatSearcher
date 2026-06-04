@@ -54,10 +54,47 @@
 
 点击或回车打开结果时，按以下优先级调用 Kiro 内部命令（兼容 Vibe / Spec 会话）：
 
-1. `kiroAgent.viewSpecSession`（优先，名字带 Spec 是历史原因，对 vibe 会话同样有效）
-2. `kiroAgent.openChatSession`（当上一个不可用或调用失败时回退）
+1. **`kiroAgent.showExecutionInChatTab(sessionId)`**（主方案）—— 仅加载会话、定位到当前位置，**不发送任何消息**，无副作用。
+2. `kiroAgent.viewSpecSession(sessionId)`（旧版兼容降级）—— 较老的 Kiro 版本使用，新版可能未注册。
+3. `kiroAgent.loadSessionWithPrompt(sessionId, '')`（最后兜底）—— ⚠ 会向会话发送一条空消息，可能污染历史，仅在前两者全不可用时使用。
 
-若两个命令都不可用，会弹出错误通知并同时列出这两个命令名，便于排查。跳转成功后搜索面板不会自动关闭，方便继续浏览。
+依次尝试，第一个调用成功的即生效；全部失败时弹出错误通知并列出候选命令名，便于排查。跳转成功后搜索面板不会自动关闭，方便继续浏览。
+
+具体每个命令的实测过程与取舍见下一节。
+
+## 会话跳转方案（研究记录）
+
+> 这一节记录"如何按 sessionId 打开历史对话"的完整探索与实测结论，作为后续维护与版本适配的依据。
+
+### 背景与约束
+
+Kiro 自带的历史对话面板搜索不支持中文、也不能搜正文，这是本扩展存在的根本原因。而"点击结果跳转到对应会话"是核心需求，因此必须先确认**能否通过 sessionId 程序化打开某个历史对话**——这一点不成立，后续一切优化都没有意义。
+
+调研中确认了两条边界：
+
+- **官方搜索弹窗无法挂载。** 官方 "Find in Chat"（命令 `kiroAgent.chat.openSearch`）只是向 Kiro 自带的、沙箱化的 React Webview 发送一条私有协议消息 `openChatSearch`，其搜索框、搜索逻辑、结果渲染全部跑在该 Webview 内部，通过私有的 `webviewProtocol` 通道通信。第三方扩展拿不到它的 DOM、监听不到它的事件、也无法注入结果。"挂官方搜索事件动态改结果"这条路在扩展 API 层面是封死的。
+- **没有公开的"查询历史会话"扩展 API。** Kiro 未对外暴露任何读取会话内容的 API，历史数据只以 JSON 文件形式存在磁盘上。因此"自己扫目录 + 解析 JSON + 自行做中文子串匹配"不是绕路，而是唯一可行的方案。
+
+### 实测过程
+
+跳转命令无法靠静态分析定论——`kiro.kiro-agent` 扩展 bundle 的源码里能搜到的命令，运行时不一定注册。为此在扩展中临时加了一个诊断命令，对当前工作区的真实会话逐一调用候选命令并人工确认结果。关键实测数据：
+
+| 候选 | 命令与参数 | 实测结果 | 结论 |
+| --- | --- | --- | --- |
+| A | `showExecutionInChatTab(sessionId)` | 完全符合预期，正确打开且无多余消息 | ✅ **采用为主方案** |
+| B | `showExecutionInChatTab(sessionId, executionId)` | 能打开，但视图被强制滚动到对话**最开头** | ❌ 不传 executionId |
+| C | 先 `acpChatView.focus` 再调 A | 与 A 表现一致 | A 已自带视图激活，focus 多余 |
+| D | `loadSessionWithPrompt(sessionId, '')` | 能加载会话，但**发出一条空消息**并触发响应 | ⚠ 仅兜底 |
+| E | `loadSessionWithPrompt(sessionId, undefined)` | 能加载，但因缺少 prompt 参数**报错** | ❌ |
+
+> 早期版本曾把 `kiroAgent.viewSpecSession` 当作主命令，但在当前 Kiro 版本运行时实测直接返回 `command 'kiroAgent.viewSpecSession' not found`——它走的是旧的 `sessionPanelManager`，新版改用 `acpChatView`（ACP 架构）后已不注册。保留它仅作为旧版本的降级候选。
+
+### 关键结论
+
+- **主方案：`kiroAgent.showExecutionInChatTab(sessionId)`，且必须省略第二个 `executionId` 参数。** 一旦传入 executionId，前端会把视图强制定位到该执行记录（通常是最早一条），导致跳到对话开头。
+- `loadSessionWithPrompt` 的前端处理会**无条件**把 `prompt` 当作一条新用户消息发送（对空 prompt 没有任何保护），因此只能作为最后兜底，且需要意识到它会污染历史。
+- 会话文件名 `<sessionId>.json` 与文件内部的 `obj.sessionId` 一致，可直接用文件名作为传给跳转命令的 sessionId。
+- 由于跳转命令名随 Kiro 版本变化，代码中以**带优先级的候选列表**依次尝试（见 `src/jump.ts` 的 `DEFAULT_CANDIDATES`），对未来版本变更具备一定韧性。
 
 ## 错误场景与排查
 
@@ -68,7 +105,7 @@
 | 当前没有打开任何工作区 | 未在 Kiro 中打开项目 | 先打开一个项目文件夹再使用搜索 |
 | 当前项目还没有 Kiro 对话历史 | 当前工作区没有对应的会话子目录 | 核对面板显示的工作区路径；先在该项目中产生对话 |
 | 搜索失败：&lt;原因&gt; | 搜索过程中出现未预期异常 | 查看提示中的原因；通常为文件系统权限问题 |
-| 无法打开会话：未找到可用的 Kiro 跳转命令 | 跳转命令不可用 | 确认扩展运行在 Kiro 中而非纯 VSCode |
+| 无法打开会话：未找到可用的 Kiro 跳转命令 | 三个候选跳转命令都不可用 | 确认扩展运行在 Kiro 中而非纯 VSCode；Kiro 版本变更可能导致命令名变化 |
 
 > 单个会话文件 JSON 损坏会被静默跳过，不影响其他结果，也不会弹出错误。
 
