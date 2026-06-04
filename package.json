@@ -4,6 +4,11 @@
   "description": "搜索 Kiro 当前项目的对话历史，点击可直接跳转到对应会话",
   "version": "0.1.0",
   "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://example.com/kiro-chat-search.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -64,6 +69,7 @@
   "devDependencies": {
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.80.0",
+    "@vscode/vsce": "^2.27.0",
     "fast-check": "^3.19.0",
     "typescript": "^5.4.0",
     "vitest": "^1.6.0"
