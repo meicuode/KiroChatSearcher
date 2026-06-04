@@ -48,7 +48,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   body {
     display: flex;
     flex-direction: column;
-    padding: 16px 14px;
+    padding: 12px 10px;
     gap: var(--gap);
     overflow: hidden;
   }
@@ -89,6 +89,10 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     opacity: .65;
     padding: 0 4px;
     line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: default;
   }
   .meta.error { color: var(--vscode-errorForeground); opacity: 1; }
   .meta code {
@@ -192,7 +196,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     </svg>
     <input id="q" type="text" placeholder="搜索当前项目的 Kiro 对话…" autocomplete="off" spellcheck="false" />
   </div>
-  <div id="status" class="meta">输入关键词开始搜索 · <kbd>↑</kbd> <kbd>↓</kbd> 选择 · <kbd>Enter</kbd> 打开</div>
+  <div id="status" class="meta">输入关键词开始搜索…</div>
   <ul id="results" class="results"></ul>
 
 <script nonce="${nonce}">
@@ -251,9 +255,12 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     vscode.postMessage({ type: 'open', sessionId: r.sessionId });
   }
 
-  function setStatus(text, isError) {
+  function setStatus(text, isError, title) {
     $status.textContent = text;
     $status.classList.toggle('error', !!isError);
+    if (typeof title === 'string') {
+      if (title) $status.title = title; else $status.removeAttribute('title');
+    }
   }
 
   $q.addEventListener('input', () => {
@@ -290,14 +297,14 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     if (m.type === 'results') {
       render(m.results, m.keyword);
       if (m.results.length) {
-        setStatus('命中 ' + m.results.length + ' 个对话（最多展示 10 条）');
+        setStatus('命中 ' + m.results.length + ' 个对话（最多展示 10 条）', false, '');
       } else if (m.keyword) {
-        setStatus('没有匹配的对话');
+        setStatus('没有匹配的对话', false, '');
       } else {
-        setStatus('输入关键词开始搜索');
+        setStatus('输入关键词开始搜索…', false, '');
       }
     } else if (m.type === 'status') {
-      setStatus(m.text, m.error);
+      setStatus(m.text, m.error, m.title);
       if (m.error) {
         $results.innerHTML = '';
         currentResults = [];
