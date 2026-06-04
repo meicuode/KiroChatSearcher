@@ -1,0 +1,71 @@
+{
+  "name": "kiro-chat-search",
+  "displayName": "Kiro Chat Search",
+  "description": "搜索 Kiro 当前项目的对话历史，点击可直接跳转到对应会话",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kiroChatSearch",
+          "title": "Kiro Chat Search",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "kiroChatSearch": [
+        {
+          "id": "kiroChatSearch.entry",
+          "name": "对话搜索",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "kiroChatSearch.openSearch",
+        "title": "Kiro: 搜索对话历史",
+        "icon": "$(search)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "kiroChatSearch.openSearch",
+          "when": "view == kiroChatSearch.entry",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "kiroChatSearch.openSearch",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0",
+    "fast-check": "^3.19.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}
