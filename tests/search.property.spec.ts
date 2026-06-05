@@ -163,7 +163,12 @@ describe('SearchEngine properties', () => {
   it('Property 15: 二次调用（命中缓存）结果一致；mtime 抬高后反映新内容', () => {
     fc.assert(
       fc.property(wordArb, wordArb, (kwA, kwB) => {
-        fc.pre(kwA.toLowerCase() !== kwB.toLowerCase());
+        const a = kwA.toLowerCase();
+        const b = kwB.toLowerCase();
+        // 两个关键词互不为子串（否则覆写后旧关键词可能仍命中新标题），
+        // 且都不是 "title" 的子串（避免命中标题里固定的 " title" 文案）
+        fc.pre(!a.includes(b) && !b.includes(a));
+        fc.pre(!'title'.includes(a) && !'title'.includes(b));
         const dir = freshDir();
         const base = 1_600_000_000_000;
         writeSession(dir, 's', { title: `${kwA} title` }, base);

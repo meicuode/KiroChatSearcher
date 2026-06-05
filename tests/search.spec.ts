@@ -296,6 +296,58 @@ describe('SearchEngine - 图片/附件标记', () => {
   });
 });
 
+describe('SearchEngine - sessions.json 清单处理', () => {
+  it('排除 sessions.json 清单文件，不作为可点击会话返回', () => {
+    const dir = freshDir();
+    // 清单文件（顶层数组），不应出现在结果里
+    writeSession(dir, 'sessions', [
+      { sessionId: 'aaa', title: 'Clean State', workspaceDirectory: dir },
+    ]);
+    writeSession(dir, 'aaa', { title: 'Agent', history: [{ message: { role: 'user', content: 'foo bar' } }] });
+
+    const recent = listRecentSessions(dir, 10);
+    expect(recent.map((r) => r.sessionId)).toEqual(['aaa']);
+    expect(recent.find((r) => r.sessionId === 'sessions')).toBeUndefined();
+  });
+
+  it('用清单中的官方标题覆盖单文件标题（Agent → 真实标题）', () => {
+    const dir = freshDir();
+    writeSession(dir, 'sessions', [
+      { sessionId: 's1', title: 'Spec: kiro-chat-search' },
+    ]);
+    // 单文件标题是泛化的 Agent
+    writeSession(dir, 's1', { title: 'Agent', history: [{ message: { role: 'user', content: 'hello' } }] });
+
+    const recent = listRecentSessions(dir, 10);
+    expect(recent).toHaveLength(1);
+    expect(recent[0].title).toBe('Spec: kiro-chat-search');
+  });
+
+  it('清单缺失时回退到单文件标题', () => {
+    const dir = freshDir();
+    writeSession(dir, 's1', { title: 'Agent', history: [] });
+    const recent = listRecentSessions(dir, 10);
+    expect(recent[0].title).toBe('Agent');
+  });
+
+  it('清单缺失且单文件无标题时回退 Untitled', () => {
+    const dir = freshDir();
+    writeSession(dir, 's1', { history: [{ message: { role: 'user', content: 'x' } }] });
+    const recent = listRecentSessions(dir, 10);
+    expect(recent[0].title).toBe('Untitled');
+  });
+
+  it('搜索按官方标题命中（清单标题可被搜到）', () => {
+    const dir = freshDir();
+    writeSession(dir, 'sessions', [{ sessionId: 's1', title: 'Refactor parser' }]);
+    writeSession(dir, 's1', { title: 'Agent', history: [{ message: { role: 'user', content: 'unrelated' } }] });
+    const hits = searchSessionsInDir(dir, 'parser');
+    expect(hits).toHaveLength(1);
+    expect(hits[0].matchField).toBe('title');
+    expect(hits[0].title).toBe('Refactor parser');
+  });
+});
+
 describe('SearchEngine - 索引缓存', () => {
   it('连续两次调用结果一致（第二次走缓存）', () => {
     const dir = freshDir();

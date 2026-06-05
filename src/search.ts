@@ -23,7 +23,8 @@ interface SessionIndexEntry {
   mtimeMs: number;
   /** 文件字节大小，与 mtimeMs 共同作为失效判据 */
   size: number;
-  title: string;
+  /** 单个会话文件里的原始标题（往往是泛化的 "Agent"），作为清单缺失时的回退 */
+  rawTitle: string;
   /** 用于关键词匹配的纯文本（已剔除 base64 图片数据） */
   text: string;
   /** 最近列表的预览来源（首条用户消息） */
@@ -118,13 +119,54 @@ function isImagePart(c: any): boolean {
 }
 
 /**
- * 加载目录的会话索引，按 mtime 失效复用缓存。
- * - 命中且 mtime 未变 → 复用缓存条目，不 read/parse。
- * - 未命中或 mtime 变化 → 解析并写回缓存。
+ * Kiro 在会话目录下维护一个 `sessions.json` 清单文件，顶层是数组，
+ * 每项形如 { sessionId, title, dateCreated, workspaceDirectory }。
+ * 它是会话**标题的权威来源**（单个会话文件里的 title 往往只是泛化的 "Agent"）。
+ * 该文件本身不是会话记录，必须从会话列表中排除。
+ */
+const MANIFEST_FILENAME = 'sessions.json';
+
+/** 读取 sessions.json 清单，返回 sessionId → 官方标题 的映射；失败则返回空 Map。 */
+function loadTitleMap(dir: string): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    const raw = fs.readFileSync(path.join(dir, MANIFEST_FILENAME), 'utf8');
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      for (const it of arr) {
+        const id = it?.sessionId;
+        const title = it?.title;
+        if (typeof id === 'string' && typeof title === 'string' && title.trim()) {
+          map.set(id, title);
+        }
+      }
+    }
+  } catch {
+    // 清单不存在或损坏：回退到单文件标题
+  }
+  return map;
+}
+
+/** loadIndex 的产出：在缓存条目基础上解析出"最终展示标题"（清单优先）。 */
+interface ResolvedSession {
+  sessionId: string;
+  mtimeMs: number;
+  title: string;
+  text: string;
+  firstUserText: string;
+  hasImage: boolean;
+  hasAttachment: boolean;
+}
+
+/**
+ * 加载目录的会话索引，按 (mtime, size) 失效复用缓存。
+ * - 命中且 mtime/size 未变 → 复用缓存条目，不 read/parse。
+ * - 未命中或变化 → 解析并写回缓存。
  * - 清理缓存中已在目录消失的条目。
+ * - 跳过 sessions.json 清单文件；并用清单中的官方标题覆盖单文件标题。
  * 返回值的顺序与 files 一致；解析失败的文件被跳过。
  */
-function loadIndex(dir: string): SessionIndexEntry[] {
+function loadIndex(dir: string): ResolvedSession[] {
   let files: string[];
   try {
     files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
@@ -132,10 +174,14 @@ function loadIndex(dir: string): SessionIndexEntry[] {
     return [];
   }
 
+  const titleMap = loadTitleMap(dir);
   const seenPaths = new Set<string>();
-  const out: SessionIndexEntry[] = [];
+  const out: ResolvedSession[] = [];
 
   for (const f of files) {
+    // 跳过会话清单文件——它不是会话记录（顶层是数组），点击会导致跳转报错
+    if (f === MANIFEST_FILENAME) continue;
+
     const full = path.join(dir, f);
     seenPaths.add(full);
 
@@ -146,34 +192,41 @@ function loadIndex(dir: string): SessionIndexEntry[] {
       continue;
     }
 
-    const cached = indexCache.get(full);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      out.push(cached);
-      continue;
+    let entry = indexCache.get(full);
+    if (!entry || entry.mtimeMs !== stat.mtimeMs || entry.size !== stat.size) {
+      let obj: any;
+      try {
+        obj = JSON.parse(fs.readFileSync(full, 'utf8'));
+      } catch {
+        // 解析失败：跳过且不写入缓存；若之前有旧条目则移除
+        indexCache.delete(full);
+        continue;
+      }
+      const parsed = parseSessionContent(obj);
+      entry = {
+        sessionId: path.basename(f, '.json'),
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        rawTitle: obj?.title || obj?.name || '',
+        text: parsed.text,
+        firstUserText: parsed.firstUserText,
+        hasImage: parsed.hasImage,
+        hasAttachment: parsed.hasAttachment,
+      };
+      indexCache.set(full, entry);
     }
 
-    let obj: any;
-    try {
-      obj = JSON.parse(fs.readFileSync(full, 'utf8'));
-    } catch {
-      // 解析失败：跳过且不写入缓存；若之前有旧条目则移除
-      indexCache.delete(full);
-      continue;
-    }
-
-    const parsed = parseSessionContent(obj);
-    const entry: SessionIndexEntry = {
-      sessionId: path.basename(f, '.json'),
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-      title: obj?.title || obj?.name || '',
-      text: parsed.text,
-      firstUserText: parsed.firstUserText,
-      hasImage: parsed.hasImage,
-      hasAttachment: parsed.hasAttachment,
-    };
-    indexCache.set(full, entry);
-    out.push(entry);
+    // 最终标题：清单官方标题优先，其次单文件标题，最后 Untitled
+    const title = titleMap.get(entry.sessionId) || entry.rawTitle || 'Untitled';
+    out.push({
+      sessionId: entry.sessionId,
+      mtimeMs: entry.mtimeMs,
+      title,
+      text: entry.text,
+      firstUserText: entry.firstUserText,
+      hasImage: entry.hasImage,
+      hasAttachment: entry.hasAttachment,
+    });
   }
 
   // 清理：缓存中存在但目录下已消失的条目（仅清理本目录下的键）

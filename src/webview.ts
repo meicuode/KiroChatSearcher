@@ -299,13 +299,27 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   }
 
   function renderList(results, keyword) {
+    // 重渲染前记住当前选中项的 sessionId，渲染后尽量保持选中（数据刷新/过滤时不跳回第一项）
+    const prevId = (activeIndex >= 0 && currentResults[activeIndex])
+      ? currentResults[activeIndex].sessionId
+      : null;
+
     currentResults = results;
-    activeIndex = results.length ? 0 : -1;
     $results.innerHTML = '';
     if (!results.length) {
+      activeIndex = -1;
       updateActive();
       return;
     }
+    // 还原选中位置：优先沿用之前选中的会话，找不到则回到第一项
+    let restored = -1;
+    if (prevId) {
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].sessionId === prevId) { restored = i; break; }
+      }
+    }
+    activeIndex = restored >= 0 ? restored : 0;
+
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
       const li = document.createElement('li');
@@ -320,7 +334,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
           '<div class="time">' + badges + fmtTime(r.modified) + '</div>' +
         '</div>' +
         '<div class="snippet">' + highlight(r.snippet || '', keyword) + '</div>';
-      li.addEventListener('click', () => open(i));
+      li.addEventListener('click', () => { activeIndex = i; updateActive(); open(i); });
       $results.appendChild(li);
     }
     updateActive();
