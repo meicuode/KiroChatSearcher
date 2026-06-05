@@ -1,5 +1,7 @@
 # Kiro Chat Search
 
+![Kiro Chat Search 效果图](./kiro_chat_search.png)
+
 在 Kiro（VSCode 衍生产品）中按关键词搜索**当前打开项目**的对话历史，点击结果直接跳转到对应会话。扩展自动识别本机 Kiro 用户数据目录与对话存储根目录，提供左侧活动栏入口与居中搜索面板，完全本地运行、零网络依赖。
 
 ## 功能概述
