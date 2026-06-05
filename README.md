@@ -149,6 +149,40 @@ npx vsce package   # 打包成 .vsix
 
 调试：在 VSCode / Kiro 中按 `F5` 启动扩展开发宿主。打包生成的 `.vsix` 可直接拖入 Kiro 的扩展面板安装。
 
+## 持续集成与自动发布（GitHub Actions）
+
+仓库内置 `.github/workflows/build.yml`，自动完成编译、测试与打包。
+
+**版本号唯一来源**：`package.json` 的 `version` 字段。`vsce` 打包时直接读取它，无需在别处另维护版本号。
+
+**触发规则**：
+
+| 触发事件 | 行为 | 产物 |
+| --- | --- | --- |
+| push 到 `main` / 发起 PR | `npm ci` → `compile` → `test` → `vsce package` | vsix 作为 **artifact** 上传（保留 30 天，可在 Actions 运行页面下载），**不创建 Release** |
+| push 形如 `v*` 的 tag（如 `v0.2.0`） | 上述全部 + 校验 tag 与 `package.json` 版本一致后创建 **GitHub Release** | Release 附带 vsix，自动生成 release notes |
+
+> tag 版本与 `package.json` 的 `version` 不一致时 CI 会**直接报错**，强制两者同步，避免发布出版本号对不上的安装包。
+
+**发布新版本的流程**：
+
+```bash
+# 1. 升级版本号（编辑 package.json 的 version，例如 0.2.0 -> 0.3.0）
+# 2. 提交并推送
+git add package.json
+git commit -m "chore: 版本号升至 0.3.0"
+git push origin main
+# 3. 打同名 tag 并推送 —— 触发自动打包 + 创建 Release
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+**说明**：
+
+- Release 用 `softprops/action-gh-release` 创建，依赖 GitHub 自动注入的 `GITHUB_TOKEN`（workflow 已声明 `permissions: contents: write`），**无需手动配置任何 secret**。
+- 当前仅面向本地 / GitHub 分发，未发布到 VS Code Marketplace 或 Open VSX；若需发布到市场，需额外配置对应的发布 token。
+- 平时若只想拿某次提交的安装包，无需打 tag：到仓库 **Actions** 页面对应运行记录的 **Artifacts** 区下载即可。
+
 ## 项目结构
 
 ```
