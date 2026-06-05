@@ -74,8 +74,9 @@ Kiro Chat Search 是一个运行在 Kiro（VSCode 衍生产品）中的扩展，
 4. THE SearchEngine SHALL 兼容以下消息结构：`obj.history[i].message.content` 为字符串、`obj.history[i].message.content[j].text`、`obj.messages[i].content`（字符串或对象数组）、`obj.messages[i].text`。
 5. THE SearchEngine SHALL 按 SessionFile 的 `mtimeMs` 修改时间倒序排序所有 SearchHit。
 6. THE SearchEngine SHALL 将返回结果数量截断到不超过 `limit`（默认 10）。
-7. IF 关键词为空白字符串,THEN THE SearchEngine SHALL 返回空数组且不读取任何 SessionFile。
+7. IF 关键词为空白字符串,THEN THE SearchEngine SHALL 不执行关键词匹配，且 SearchPanel SHALL 转而展示最近会话列表（见 Requirement 4.9）。
 8. WHEN 用户在搜索框连续输入,THE SearchPanel SHALL 在最后一次按键 120 毫秒后才向扩展主进程发送一次搜索请求（输入防抖）。
+9. WHEN 关键词为空（包括首次打开面板与用户清空输入），THE SearchEngine SHALL 通过 `listRecentSessions` 返回当前 WorkspaceSessionDir 下按 `mtimeMs` 倒序的最近会话列表，最多 20 条；每条 SearchHit 的 `matchField` 为 `'recent'`，`snippet` 取自首条用户消息文本（截断到 160 字符并折叠空白），缺少用户消息时为空串。
 
 ### Requirement 5: JSON 解析与文件读取容错
 

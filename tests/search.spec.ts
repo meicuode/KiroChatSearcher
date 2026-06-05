@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { searchSessionsInDir } from '../src/search';
+import { searchSessionsInDir, listRecentSessions } from '../src/search';
 import { mkTempDir, rmTempDir, writeSession, writeRaw } from './_helpers';
 
 const tmpDirs: string[] = [];
@@ -118,5 +118,75 @@ describe('searchSessionsInDir - 排序与 limit', () => {
     }
     // 最新的应排在最前
     expect(hits[0].title).toBe('match item 14');
+  });
+});
+
+
+describe('listRecentSessions', () => {
+  it('按 mtime 倒序、限制到 limit 条、matchField=recent', () => {
+    const dir = freshDir();
+    const now = Date.now();
+    // 写入 5 条会话，mtime 递增
+    for (let i = 0; i < 5; i++) {
+      writeSession(
+        dir,
+        `s${i}`,
+        {
+          title: `t${i}`,
+          history: [
+            { message: { role: 'user', content: [{ type: 'text', text: `hello-${i}` }] } },
+          ],
+        },
+        now + i * 1000
+      );
+    }
+    const recent = listRecentSessions(dir, 3);
+    expect(recent).toHaveLength(3);
+    expect(recent.map((r) => r.title)).toEqual(['t4', 't3', 't2']);
+    for (const r of recent) {
+      expect(r.matchField).toBe('recent');
+      expect(r.snippet.startsWith('hello-')).toBe(true);
+    }
+  });
+
+  it('snippet 取自首条用户消息（跳过 assistant），缺少时为空串', () => {
+    const dir = freshDir();
+    writeSession(dir, 'with-user', {
+      title: '有用户消息',
+      history: [
+        { message: { role: 'assistant', content: '助手消息' } },
+        { message: { role: 'user', content: '你好世界' } },
+      ],
+    });
+    writeSession(dir, 'no-user', {
+      title: '只有助手',
+      history: [{ message: { role: 'assistant', content: '只我一个' } }],
+    });
+    const recent = listRecentSessions(dir, 10);
+    const a = recent.find((r) => r.title === '有用户消息');
+    const b = recent.find((r) => r.title === '只有助手');
+    expect(a?.snippet).toBe('你好世界');
+    expect(b?.snippet).toBe('');
+  });
+
+  it('损坏 JSON 与 stat 失败的文件被静默跳过，不影响其余结果', () => {
+    const dir = freshDir();
+    writeSession(dir, 'good', { title: '正常', history: [] });
+    writeRaw(dir, 'bad.json', '{not-json');
+    const recent = listRecentSessions(dir, 10);
+    expect(recent.map((r) => r.title)).toEqual(['正常']);
+  });
+
+  it('读不到目录时返回空数组', () => {
+    const recent = listRecentSessions('/no/such/dir/exists/here', 10);
+    expect(recent).toEqual([]);
+  });
+
+  it('缺少 title 与 name 时回退到 Untitled', () => {
+    const dir = freshDir();
+    writeSession(dir, 'anon', { history: [{ message: { role: 'user', content: 'hi' } }] });
+    const recent = listRecentSessions(dir, 10);
+    expect(recent[0].title).toBe('Untitled');
+    expect(recent[0].snippet).toBe('hi');
   });
 });

@@ -1,11 +1,16 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { checkEnvironment, EnvCheck } from './env';
-import { searchSessionsInDir } from './search';
+import { searchSessionsInDir, listRecentSessions } from './search';
 import { resolveAndExecuteJumpCommand } from './jump';
 import { getWebviewHtml } from './webview';
 
 const PANEL_VIEW_TYPE = 'kiroChatSearch.panel';
+
+/** 无搜索关键词时默认展示最近 N 条 */
+const RECENT_DEFAULT_LIMIT = 20;
+/** 有关键词时返回的最大命中条数 */
+const SEARCH_RESULT_LIMIT = 10;
 
 /** 取当前工作区第一个文件夹（供 EnvChecker 注入） */
 function currentWorkspaceFolder(): { uri: { fsPath: string } } | null {
@@ -86,21 +91,40 @@ class SearchSession {
       title: tooltipLines.join('\n'),
       error: false,
     });
+
+    // 默认展示最近 N 条，方便用户不输入也能直接选
+    this.pushRecent();
+  }
+
+  private pushRecent() {
+    const env = checkEnv();
+    if (!env.ok || !env.workspaceDir) return;
+    try {
+      const results = listRecentSessions(env.workspaceDir, RECENT_DEFAULT_LIMIT);
+      this.webview.postMessage({
+        type: 'results',
+        results,
+        keyword: '',
+      });
+    } catch {
+      // 静默：环境状态条已经表明就绪，最近列表失败不必弹错误
+    }
   }
 
   private runSearch(keyword: string) {
     const trimmed = keyword.trim();
-    if (!trimmed) {
-      this.webview.postMessage({ type: 'results', results: [], keyword: '' });
-      return;
-    }
     const env = checkEnv();
     if (!env.ok || !env.workspaceDir) {
       this.pushEnvironmentStatus();
       return;
     }
+    // 空关键词 → 切回"最近 N 条"
+    if (!trimmed) {
+      this.pushRecent();
+      return;
+    }
     try {
-      const results = searchSessionsInDir(env.workspaceDir, trimmed, 10);
+      const results = searchSessionsInDir(env.workspaceDir, trimmed, SEARCH_RESULT_LIMIT);
       this.webview.postMessage({
         type: 'results',
         results,

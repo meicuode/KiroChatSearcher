@@ -456,9 +456,11 @@ sequenceDiagram
 
 **Validates: Requirements 1.5, 1.6**
 
-### Property 3: base64url 编码合法且可逆
+### Property 3: base64url 编码合法、确定、注入
 
-*For any* 字符串 `s`（任意 UTF-8 输入），`encodeWorkspaceKeys` 内部使用的 base64url 变换的输出 `encoded` 满足：(a) `encoded` 仅由 `[A-Za-z0-9_-]` 组成（不含 `=`、`+`、`/`）；(b) 将 `_→/`、`-→+`、再补齐 `=` 进行 base64 解码后，能完全还原出原始字符串 `s`。
+*For any* 字符串 `s`、`t`（任意 UTF-8 输入），`encodeWorkspaceKeys` 内部使用的 base64url 变换满足：(a) 输出 `encoded` 仅由 `[A-Za-z0-9_-]` 组成（不含 `=`、`+`、`/`）；(b) 确定性——对同一输入多次编码结果相同；(c) 注入性——若 `s !== t` 则 `encode(s) !== encode(t)`。
+
+> 注：Kiro 把 padding `=` 也替换为 `_`，与原文 `/` 替换后的 `_` 共用同一字符，因此从纯字符串形式无法无歧义地反向解码（不存在严格的"可逆性"）。设计上接受这个歧义，因为底层 base64 自身是注入的，编码后路径仍可作为唯一的目录键使用。
 
 **Validates: Requirements 2.1**
 

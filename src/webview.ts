@@ -217,9 +217,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     activeIndex = results.length ? 0 : -1;
     $results.innerHTML = '';
     if (!results.length) {
-      if (keyword) {
-        $results.innerHTML = '<li class="empty">没有匹配的对话</li>';
-      }
+      // 列表为空时不再渲染占位文本，由状态条统一表达（命中 0 / 无历史 / 等）
       updateActive();
       return;
     }
@@ -296,12 +294,20 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     const m = e.data;
     if (m.type === 'results') {
       render(m.results, m.keyword);
-      if (m.results.length) {
-        setStatus('命中 ' + m.results.length + ' 个对话（最多展示 10 条）', false, '');
-      } else if (m.keyword) {
-        setStatus('没有匹配的对话', false, '');
+      if (m.keyword) {
+        // 有关键词：搜索命中或未命中
+        if (m.results.length) {
+          setStatus('命中 ' + m.results.length + ' 个对话（最多展示 10 条）', false, '');
+        } else {
+          setStatus('没有匹配的对话', false, '');
+        }
       } else {
-        setStatus('输入关键词开始搜索…', false, '');
+        // 无关键词：默认展示最近列表
+        if (m.results.length) {
+          setStatus('最近 ' + m.results.length + ' 个对话 · 输入关键词可搜索', false, '');
+        } else {
+          setStatus('当前项目还没有对话历史', false, '');
+        }
       }
     } else if (m.type === 'status') {
       setStatus(m.text, m.error, m.title);
