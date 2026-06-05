@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://example.com/kiro-chat-search.git"
+    "url": "https://github.com/meicuode/KiroChatSearcher.git"
   },
   "engines": {
     "vscode": "^1.80.0"

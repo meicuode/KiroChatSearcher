@@ -1,0 +1,76 @@
+name: Build & Release VSIX
+
+# 触发：
+# - 推送到 main / PR：编译、测试、打包，并把 vsix 作为构建产物（artifact）上传，
+#   可在 Actions 运行页面下载，便于每次更新都能拿到安装包，但不创建正式 Release。
+# - 推送形如 v* 的 tag（如 v0.2.0）：在上述基础上额外创建 GitHub Release 并附带 vsix。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # 创建 Release / 上传产物需要
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read package version
+        id: pkg
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # 仅在 tag 触发时执行：强制 tag (vX.Y.Z) 与 package.json version 一致，
+      # 保证版本真相源唯一，避免发布出版本号对不上的安装包。
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="${{ steps.pkg.outputs.version }}"
+          echo "tag=$TAG_VERSION  package.json=$PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME 与 package.json version ($PKG_VERSION) 不一致。请先更新 package.json 再打同名 tag。"
+            exit 1
+          fi
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Test
+        run: npm test
+
+      - name: Package VSIX
+        run: npx vsce package --no-dependencies --out "kiro-chat-search-${{ steps.pkg.outputs.version }}.vsix"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiro-chat-search-${{ steps.pkg.outputs.version }}
+          path: 'kiro-chat-search-*.vsix'
+          retention-days: 30
+          if-no-files-found: error
+
+      # 仅在 tag 触发时创建 Release 并附带 vsix
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: 'kiro-chat-search-*.vsix'
