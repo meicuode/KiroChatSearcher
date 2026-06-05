@@ -1,10 +1,15 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import fc from 'fast-check';
-import { searchSessionsInDir, makeSnippet } from '../src/search';
+import {
+  searchSessionsInDir,
+  makeSnippet,
+  __clearIndexCacheForTest,
+} from '../src/search';
 import { mkTempDir, rmTempDir, writeSession, writeRaw } from './_helpers';
 
 const tmpDirs: string[] = [];
 afterEach(() => {
+  __clearIndexCacheForTest();
   while (tmpDirs.length) rmTempDir(tmpDirs.pop()!);
 });
 
@@ -96,6 +101,85 @@ describe('SearchEngine properties', () => {
           expect(after).toEqual(before);
         }
       ),
+      { numRuns: 40 }
+    );
+  });
+
+  // Feature: kiro-chat-search, Property 12: 图片检测正确且不依赖 base64 内容
+  it('Property 12: 当且仅当存在图片标志项时 hasImage=true，且与 base64 内容无关', () => {
+    fc.assert(
+      fc.property(
+        fc.boolean(),
+        fc.string(), // 任意 base64 占位内容（长度/内容不应影响检测结果）
+        wordArb,
+        (withImage, b64, kw) => {
+          const dir = freshDir();
+          const content: any[] = [{ type: 'text', text: `${kw} body` }];
+          if (withImage) {
+            content.push({ type: 'imageUrl', imageUrl: { url: 'data:image/png;base64,' + b64 } });
+          }
+          writeSession(dir, 's', {
+            title: `${kw} t`,
+            history: [{ message: { role: 'user', content } }],
+          });
+          const hits = searchSessionsInDir(dir, kw, 10);
+          expect(hits).toHaveLength(1);
+          expect(hits[0].hasImage).toBe(withImage);
+        }
+      ),
+      { numRuns: 60 }
+    );
+  });
+
+  // Feature: kiro-chat-search, Property 13: 附件检测等价于存在非空 contextItems
+  it('Property 13: hasAttachment 当且仅当存在非空 contextItems', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 3 }), // contextItems 数量
+        wordArb,
+        (ctxCount, kw) => {
+          const dir = freshDir();
+          const contextItems = Array.from({ length: ctxCount }, (_, i) => ({
+            id: String(i),
+            name: `f${i}.cs`,
+            uri: `file:///f${i}.cs`,
+            content: 'x',
+            description: 'd',
+          }));
+          writeSession(dir, 's', {
+            title: `${kw} t`,
+            history: [{ message: { role: 'user', content: `${kw} body` }, contextItems }],
+          });
+          const hits = searchSessionsInDir(dir, kw, 10);
+          expect(hits).toHaveLength(1);
+          expect(hits[0].hasAttachment).toBe(ctxCount > 0);
+        }
+      ),
+      { numRuns: 60 }
+    );
+  });
+
+  // Feature: kiro-chat-search, Property 15: 缓存不改变可观察结果
+  it('Property 15: 二次调用（命中缓存）结果一致；mtime 抬高后反映新内容', () => {
+    fc.assert(
+      fc.property(wordArb, wordArb, (kwA, kwB) => {
+        fc.pre(kwA.toLowerCase() !== kwB.toLowerCase());
+        const dir = freshDir();
+        const base = 1_600_000_000_000;
+        writeSession(dir, 's', { title: `${kwA} title` }, base);
+
+        const first = searchSessionsInDir(dir, kwA, 10);
+        const second = searchSessionsInDir(dir, kwA, 10); // 走缓存
+        expect(second).toEqual(first);
+        expect(first).toHaveLength(1);
+
+        // 覆写内容并抬高 mtime → 缓存按 mtime 失效，结果反映新内容
+        writeSession(dir, 's', { title: `${kwB} title` }, base + 10_000);
+        expect(searchSessionsInDir(dir, kwA, 10)).toHaveLength(0);
+        expect(searchSessionsInDir(dir, kwB, 10)).toHaveLength(1);
+
+        __clearIndexCacheForTest();
+      }),
       { numRuns: 40 }
     );
   });

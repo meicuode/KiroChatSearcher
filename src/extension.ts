@@ -27,6 +27,8 @@ function checkEnv(): EnvCheck {
  */
 class SearchSession {
   private disposables: vscode.Disposable[] = [];
+  /** 记录当前关键词，供 revalidate（切换过滤/重新可见）时按相同条件重新取数 */
+  private lastKeyword = '';
 
   constructor(private readonly webview: vscode.Webview) {
     this.webview.onDidReceiveMessage(
@@ -52,6 +54,15 @@ class SearchSession {
     this.webview.postMessage({ type: 'focus' });
   }
 
+  /**
+   * 重新按当前关键词取数并推送（不改变环境状态条）。
+   * 用于：面板重新可见、前端切换附件过滤时——确保过滤作用在最新数据上，
+   * 而非面板打开时的旧快照。底层有 mtime/size 缓存，重读开销很小。
+   */
+  refresh() {
+    this.runSearch(this.lastKeyword);
+  }
+
   private handleMessage(msg: any) {
     switch (msg?.type) {
       case 'ready':
@@ -59,6 +70,10 @@ class SearchSession {
         break;
       case 'search':
         this.runSearch(String(msg.keyword || ''));
+        break;
+      case 'revalidate':
+        // 前端切换过滤 tab 前请求刷新数据源
+        this.runSearch(this.lastKeyword);
         break;
       case 'open':
         this.openSession(String(msg.sessionId || ''));
@@ -113,6 +128,7 @@ class SearchSession {
 
   private runSearch(keyword: string) {
     const trimmed = keyword.trim();
+    this.lastKeyword = trimmed;
     const env = checkEnv();
     if (!env.ok || !env.workspaceDir) {
       this.pushEnvironmentStatus();
@@ -195,6 +211,14 @@ class SearchPanel {
       null,
       this.disposables
     );
+    // 面板重新变为可见时刷新数据，避免展示打开时的旧快照
+    panel.onDidChangeViewState(
+      (e) => {
+        if (e.webviewPanel.visible) this.session.refresh();
+      },
+      null,
+      this.disposables
+    );
     panel.onDidDispose(() => this.dispose(), null, this.disposables);
   }
 
@@ -230,6 +254,10 @@ class EntryViewProvider implements vscode.WebviewViewProvider {
 
     const session = new SearchSession(view.webview);
     view.onDidDispose(() => session.dispose());
+    // 视图重新可见时刷新数据（侧边栏切走再切回 / 折叠展开）
+    view.onDidChangeVisibility(() => {
+      if (view.visible) session.refresh();
+    });
   }
 }
 

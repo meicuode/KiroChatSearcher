@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { escapeHtml, escapeRegExp, highlight, fmtTime } from './webview/format';
+import { applyAttachmentFilter } from './webview/filter';
 
 /**
  * 把共享的纯函数序列化为内联脚本源码，保证 webview 运行时与单元测试
@@ -11,6 +12,7 @@ function injectedFormatScript(): string {
     escapeRegExp.toString(),
     highlight.toString(),
     fmtTime.toString(),
+    applyAttachmentFilter.toString(),
   ].join('\n');
 }
 
@@ -102,6 +104,30 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     border-radius: 4px;
     font-size: 11px;
   }
+  .filters {
+    display: flex;
+    gap: 6px;
+    padding: 0 2px;
+  }
+  .filter-chip {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, rgba(127,127,127,.35)));
+    background: transparent;
+    color: var(--vscode-foreground);
+    opacity: .7;
+    cursor: pointer;
+    user-select: none;
+    transition: background .12s ease, opacity .12s ease, border-color .12s ease;
+  }
+  .filter-chip:hover { opacity: 1; }
+  .filter-chip.active {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-color: var(--vscode-button-background);
+    opacity: 1;
+  }
   .results {
     flex: 1;
     overflow-y: auto;
@@ -156,6 +182,11 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     opacity: .6;
     flex-shrink: 0;
   }
+  .badge {
+    font-size: 11px;
+    margin-right: 2px;
+    opacity: .85;
+  }
   .snippet {
     font-size: 12px;
     opacity: .8;
@@ -197,6 +228,11 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     <input id="q" type="text" placeholder="搜索当前项目的 Kiro 对话…" autocomplete="off" spellcheck="false" />
   </div>
   <div id="status" class="meta">输入关键词开始搜索…</div>
+  <div class="filters">
+    <span class="filter-chip active" data-mode="all">全部</span>
+    <span class="filter-chip" data-mode="image">🖼 含图片</span>
+    <span class="filter-chip" data-mode="attachment">📎 含附件</span>
+  </div>
   <ul id="results" class="results"></ul>
 
 <script nonce="${nonce}">
@@ -204,20 +240,28 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   const $q = document.getElementById('q');
   const $status = document.getElementById('status');
   const $results = document.getElementById('results');
+  const $filters = document.querySelectorAll('.filter-chip');
   let activeIndex = -1;
-  let currentResults = [];
+  let rawResults = [];        // Host 推送的原始结果（未过滤）
+  let currentResults = [];    // 当前展示的结果（已应用 AttachmentFilter）
   let currentKeyword = '';
+  let filterMode = 'all';
   let debounceTimer;
 
   ${injectedFormatScript()}
 
-  function render(results, keyword) {
+  /** 在原始结果上应用当前附件过滤，并刷新列表与状态条 */
+  function applyAndRender() {
+    const filtered = applyAttachmentFilter(rawResults, filterMode);
+    renderList(filtered, currentKeyword);
+    updateStatus();
+  }
+
+  function renderList(results, keyword) {
     currentResults = results;
-    currentKeyword = keyword;
     activeIndex = results.length ? 0 : -1;
     $results.innerHTML = '';
     if (!results.length) {
-      // 列表为空时不再渲染占位文本，由状态条统一表达（命中 0 / 无历史 / 等）
       updateActive();
       return;
     }
@@ -226,16 +270,38 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
       const li = document.createElement('li');
       li.className = 'item';
       li.dataset.index = i;
+      const badges =
+        (r.hasImage ? '<span class="badge" title="含图片">🖼 </span>' : '') +
+        (r.hasAttachment ? '<span class="badge" title="含附件">📎 </span>' : '');
       li.innerHTML =
         '<div class="row1">' +
           '<div class="title">' + highlight(r.title || 'Untitled', keyword) + '</div>' +
-          '<div class="time">' + fmtTime(r.modified) + '</div>' +
+          '<div class="time">' + badges + fmtTime(r.modified) + '</div>' +
         '</div>' +
         '<div class="snippet">' + highlight(r.snippet || '', keyword) + '</div>';
       li.addEventListener('click', () => open(i));
       $results.appendChild(li);
     }
     updateActive();
+  }
+
+  /** 根据关键词 / 过滤模式 / 结果数量给出状态条文案 */
+  function updateStatus() {
+    const n = currentResults.length;
+    const filtering = filterMode !== 'all';
+    if (currentKeyword) {
+      if (n) {
+        setStatus('命中 ' + n + ' 个对话' + (filtering ? '（已按附件过滤）' : '（最多展示 10 条）'), false, '');
+      } else {
+        setStatus(filtering ? '没有符合条件的对话' : '没有匹配的对话', false, '');
+      }
+    } else {
+      if (n) {
+        setStatus('最近 ' + n + ' 个对话' + (filtering ? '（已按附件过滤）' : ' · 输入关键词可搜索'), false, '');
+      } else {
+        setStatus(filtering ? '没有符合条件的对话' : '当前项目还没有对话历史', false, '');
+      }
+    }
   }
 
   function updateActive() {
@@ -293,32 +359,34 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   window.addEventListener('message', (e) => {
     const m = e.data;
     if (m.type === 'results') {
-      render(m.results, m.keyword);
-      if (m.keyword) {
-        // 有关键词：搜索命中或未命中
-        if (m.results.length) {
-          setStatus('命中 ' + m.results.length + ' 个对话（最多展示 10 条）', false, '');
-        } else {
-          setStatus('没有匹配的对话', false, '');
-        }
-      } else {
-        // 无关键词：默认展示最近列表
-        if (m.results.length) {
-          setStatus('最近 ' + m.results.length + ' 个对话 · 输入关键词可搜索', false, '');
-        } else {
-          setStatus('当前项目还没有对话历史', false, '');
-        }
-      }
+      rawResults = m.results || [];
+      currentKeyword = m.keyword || '';
+      applyAndRender();
     } else if (m.type === 'status') {
       setStatus(m.text, m.error, m.title);
       if (m.error) {
         $results.innerHTML = '';
+        rawResults = [];
         currentResults = [];
       }
     } else if (m.type === 'focus') {
       $q.focus();
       $q.select();
     }
+  });
+
+  // 附件过滤 chip 切换：先即时在现有数据上过滤（即时反馈），
+  // 同时请求 host 重新取最新数据（revalidate），到货后会再渲染一次，
+  // 确保过滤作用在最新的会话列表上（含面板打开后新增的对话）。
+  $filters.forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const mode = chip.dataset.mode || 'all';
+      if (mode === filterMode) return;
+      filterMode = mode;
+      $filters.forEach((c) => c.classList.toggle('active', c === chip));
+      applyAndRender();
+      vscode.postMessage({ type: 'revalidate' });
+    });
   });
 
   // 初始焦点

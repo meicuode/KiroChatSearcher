@@ -223,6 +223,67 @@ flowchart LR
     - Ensure all tests pass, ask the user if questions arise.
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8_
 
+## Tasks（附件/图片过滤 + 索引缓存 增量）
+
+> 以下任务为在已完成的核心功能之上新增"按附件/图片过滤"与"会话索引缓存性能"能力，对应 Requirement 12、13 与 design.md 的 Property 12~15。
+
+- [x] 10. SearchEngine 引入索引缓存与附件/图片标记
+  - [x] 10.1 抽出文件解析为 `SessionIndexEntry` 的纯函数
+    - 在 `src/search.ts` 中新增内部函数，将单个会话对象解析为 `{ title, text, firstUserText, hasImage, hasAttachment }`
+    - `text` 构建时跳过 `imageUrl` / `image` / `data:` URL 内嵌二进制（Requirement 13.5）；图片检测见到 `type~image` 或 `imageUrl` 即短路置位、不读 base64（Requirement 12.1, 12.3）；`hasAttachment` = 任一消息项 `contextItems` 非空（Requirement 12.2）
+    - 兼容既有多种消息结构（history/messages、content 字符串/数组、message.text）
+    - _Requirements: 12.1, 12.2, 12.3, 13.5_
+
+  - [x] 10.2 实现 `SessionIndexCache` 与 `loadIndex(dir)`
+    - 在 `src/search.ts` 中以模块级 `Map<绝对路径, SessionIndexEntry>` 实现进程内缓存
+    - `loadIndex(dir)`：`readdir` 目录，对每个 `.json` 按 `mtimeMs` 比对缓存——命中且 mtime 未变则复用（不 read/parse）；否则解析并写回；并清理目录中已消失的缓存条目（Requirement 13.2, 13.3, 13.4）
+    - 单文件 stat/read/parse 失败时跳过且不写入缓存，不抛异常
+    - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.6_
+
+  - [x] 10.3 让 `searchSessionsInDir` 与 `listRecentSessions` 基于 `loadIndex`
+    - 两个函数改为消费 `loadIndex(dir)` 的条目，保持现有可观察行为（标题优先、snippet 截取、mtime 倒序、limit 截断、空白关键词→最近列表）
+    - 在每个 `SearchHit` 上填充 `hasImage` / `hasAttachment`（Requirement 12.4）
+    - `SearchHit.matchField` 类型扩展为含 `'recent'`（若尚未）
+    - _Requirements: 4.1, 4.2, 4.3, 4.5, 4.6, 4.9, 12.4, 13.7_
+
+  - [x]* 10.4 SearchEngine 附件/图片标记与缓存单测
+    - 在 `tests/search.spec.ts` 中覆盖：含 `imageUrl` 的会话 `hasImage===true`、纯文本会话 `hasImage===false`、非空 `contextItems` → `hasAttachment===true`、空数组/缺字段 → `false`；base64 不进入匹配文本（搜 base64 片段搜不到）
+    - 缓存：同目录连续两次调用结果一致；改文件并抬高 mtime 后结果反映新内容；删除文件后不再返回
+    - _Requirements: 12.1, 12.2, 12.4, 13.2, 13.3, 13.4, 13.5_
+
+  - [x]* 10.5 Property 12 / 13 / 15（SearchEngine 属性测试）
+    - 在 `tests/search.property.spec.ts` 中新增三条属性测试
+    - **Property 12: 图片检测正确且不依赖 base64 内容** — Validates: Requirements 12.1, 12.3
+    - **Property 13: 附件检测等价于存在非空 contextItems** — Validates: Requirements 12.2
+    - **Property 15: 缓存不改变可观察结果** — Validates: Requirements 13.2, 13.3, 13.7
+
+- [x] 11. AttachmentFilter 过滤逻辑与 UI
+  - [x] 11.1 抽出过滤纯函数 `applyAttachmentFilter`
+    - 新建 `src/webview/filter.ts`（或并入 `format.ts`），导出 `applyAttachmentFilter(results, mode)`，`mode ∈ 'all' | 'image' | 'attachment'`
+    - 返回输入的子序列（保序、不增项），与 `format` 同样通过 `toString()` 注入 webview 运行时，确保前端与单测同源
+    - _Requirements: 12.6_
+
+  - [x] 11.2 在 webview UI 中加入过滤控件并接线
+    - 在 `src/webview.ts` 的搜索框下方加入三态过滤控件（全部 / 仅含图片 / 仅含附件）
+    - 切换过滤时在已收到的 `currentResults` 上调用 `applyAttachmentFilter` 重新渲染，不向 Host 发请求（Requirement 12.7）；收到新 `results` 时在新数据上重新应用当前过滤模式（Requirement 12.8）
+    - 过滤后为空时状态条显示"没有符合条件的对话"（Requirement 12.9）
+    - 高亮、键盘导航、点击打开等既有交互在过滤后的列表上仍然成立
+    - _Requirements: 12.5, 12.6, 12.7, 12.8, 12.9_
+
+  - [x]* 11.3 AttachmentFilter 单测与 Property 14
+    - 在 `tests/filter.spec.ts` 中表驱动覆盖三种 mode 的过滤结果
+    - 在 `tests/filter.property.spec.ts` 中实现 **Property 14: AttachmentFilter 过滤的幂等与子集性** — Validates: Requirements 12.6, 12.8
+
+- [x] 12. 编译与测试验证（Checkpoint）
+  - [x] 12.1 运行 `tsc` 编译并修复类型错误
+    - 执行 `npm run compile`，确认 `out/` 含新增/改动模块
+    - _Requirements: 13.1_
+
+  - [x] 12.2 运行 `vitest run` 确保全部测试通过
+    - 执行 `npm test`，确保新增 Property 12~15 与附件/缓存单测全部通过，且既有 58 条测试不回归
+    - Ensure all tests pass, ask the user if questions arise.
+    - _Requirements: 12.1, 12.2, 12.3, 12.4, 12.6, 13.2, 13.3, 13.4, 13.5, 13.7_
+
 ## Notes
 
 - 标 `*` 的子任务为可选测试任务（property 测试与单元测试），可在 MVP 路径上跳过；但本计划建议全部实现以满足 Requirement 10 的覆盖要求。

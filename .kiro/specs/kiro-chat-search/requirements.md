@@ -21,8 +21,11 @@ Kiro Chat Search 是一个运行在 Kiro（VSCode 衍生产品）中的扩展，
 - **WorkspacePath**: 当前在 Kiro 中打开的工作区根目录的绝对路径。
 - **WorkspaceSessionDir**: 当前工作区对应的会话子目录，路径为 `<SessionsRoot>/<base64url(WorkspacePath)>`。
 - **EncodedKey**: 工作区路径经过 `base64(workspacePath)` 后去掉 `=`，将 `+` 替换为 `-`、`/` 替换为 `_` 得到的目录名。
-- **SearchHit**: 单条搜索结果，含 sessionId、title、modified、snippet、matchField。
-- **JumpCommand**: 用于打开会话的 Kiro 内部命令，主用 `kiroAgent.viewSpecSession`，回退 `kiroAgent.openChatSession`。
+- **SearchHit**: 单条搜索结果，含 sessionId、title、modified、snippet、matchField、hasImage、hasAttachment。
+- **JumpCommand**: 用于打开会话的 Kiro 内部命令，按优先级为 `kiroAgent.showExecutionInChatTab`（主，仅传 sessionId）→ `kiroAgent.viewSpecSession`（旧版兼容）→ `kiroAgent.loadSessionWithPrompt`（兜底，有发消息副作用）。
+- **AttachmentFlag**: 单个 SessionFile 的两个布尔标记 `hasImage` 与 `hasAttachment`，分别表示该会话是否包含内嵌图片与是否包含非空附件（contextItems）。
+- **SessionIndexCache**: 进程内的会话索引缓存，按 SessionFile 的绝对路径与 `mtimeMs` 作为失效依据，缓存已解析出的标题、纯文本与 AttachmentFlag，使重复搜索/过滤无需重新读取与解析未变更的文件。
+- **AttachmentFilter**: 用户在 SearchPanel 选择的过滤条件（全部 / 仅含图片 / 仅含附件），作用于搜索结果与最近列表。
 
 ## Requirements
 
@@ -174,3 +177,34 @@ Kiro Chat Search 是一个运行在 Kiro（VSCode 衍生产品）中的扩展，
 3. THE README SHALL 列出全部错误场景（Requirement 7 列出的六类）及对应排查方法。
 4. THE README SHALL 提供本地开发与打包步骤（`npm install`、`npm run compile`、`npm test`、`npx vsce package`）。
 5. THE README SHALL 描述 WorkspacePath 编码规则（base64 去 `=`、`+` -> `-`、`/` -> `_`）以及盘符大小写与斜杠变体的处理策略。
+
+### Requirement 12: 按附件与图片过滤会话
+
+**User Story:** 作为用户，我希望能快速筛选出"包含图片"或"包含附件"的对话，从而在大量历史中迅速定位带有视觉素材或引用了文件上下文的会话。
+
+#### Acceptance Criteria
+
+1. WHEN SearchEngine 解析一个 SessionFile，THE SearchEngine SHALL 计算该会话的 `hasImage` 布尔标记：当任一消息的 `content` 数组中存在 `type` 含 `image` 的项或存在 `imageUrl` / `image` 字段时为 `true`，否则为 `false`。
+2. WHEN SearchEngine 解析一个 SessionFile，THE SearchEngine SHALL 计算该会话的 `hasAttachment` 布尔标记：当任一消息项的 `contextItems` 为非空数组时为 `true`，否则为 `false`。
+3. WHEN SearchEngine 检测 `hasImage`，THE SearchEngine SHALL 在发现首个图片标志后立即停止该会话的图片扫描，且 SHALL NOT 读取或比对内嵌的 base64 图片数据内容。
+4. THE SearchEngine SHALL 在每个返回的 SearchHit 中包含 `hasImage` 与 `hasAttachment` 两个布尔字段，无论结果来自关键词搜索还是最近列表。
+5. THE SearchPanel SHALL 提供一个 AttachmentFilter 控件，至少支持三种取值：全部、仅含图片、仅含附件。
+6. WHEN 用户选择"仅含图片"，THE SearchPanel SHALL 仅展示 `hasImage === true` 的结果；WHEN 用户选择"仅含附件"，THE SearchPanel SHALL 仅展示 `hasAttachment === true` 的结果；WHEN 用户选择"全部"，THE SearchPanel SHALL 不按附件维度过滤。
+7. WHEN 用户切换 AttachmentFilter，THE SearchPanel SHALL 先立即在已持有的结果上按新模式过滤渲染（即时反馈），同时向扩展宿主请求按当前关键词重新取数（revalidate），并在收到最新结果后再次应用过滤渲染，从而保证过滤作用于**最新**会话数据（含面板打开后新增的对话）。底层 SessionIndexCache 按 `(mtime, size)` 失效，使该重新取数仅重解析发生变化的文件，开销很小。
+8. WHILE AttachmentFilter 处于"仅含图片"或"仅含附件"，WHEN 用户输入或修改关键词，THE SearchPanel SHALL 在关键词匹配结果的基础上叠加该附件过滤条件。
+9. WHEN AttachmentFilter 生效后过滤结果为空，THE SearchPanel SHALL 显示形如"没有符合条件的对话"的状态提示，而非错误提示。
+10. WHEN SearchPanel 或 EntryView 重新变为可见（面板切回 / 侧边栏展开），THE Extension SHALL 按当前关键词重新取数并推送，以避免展示打开时的旧快照。
+
+### Requirement 13: 会话索引缓存与解析性能
+
+**User Story:** 作为用户，我希望即使当前项目有成百上千条对话历史，搜索、过滤与最近列表也能保持流畅，不会每次输入都明显卡顿。
+
+#### Acceptance Criteria
+
+1. THE SearchEngine SHALL 维护一个 SessionIndexCache，以 SessionFile 的绝对路径为键，缓存其 `mtimeMs`、文件字节大小 `size`、标题、用于匹配的纯文本（已剔除内嵌 base64 图片数据）、`hasImage` 与 `hasAttachment`。
+2. WHEN SearchEngine 处理一个 SessionFile 且其当前 `mtimeMs` 与 `size` 均与缓存中记录一致，THE SearchEngine SHALL 复用缓存条目，且 SHALL NOT 重新 `readFileSync` 或 `JSON.parse` 该文件。
+3. WHEN 一个 SessionFile 的 `mtimeMs` 或 `size` 较缓存记录发生变化、或缓存中不存在该条目，THE SearchEngine SHALL 重新读取并解析该文件并更新缓存条目，从而保证仍在增长的会话（追加新消息后 mtime 与 size 均会变化）能反映最新内容。
+4. WHEN 缓存中存在的某个 SessionFile 在 WorkspaceSessionDir 中已不存在，THE SearchEngine SHALL 从缓存中移除对应条目，避免返回已删除的会话。
+5. WHEN SearchEngine 提取用于匹配与预览的纯文本，THE SearchEngine SHALL 排除内嵌 base64 图片数据（如 `imageUrl` 的 `data:` URL），以避免将大体积二进制串纳入解析后保留的文本与匹配范围。
+6. THE SessionIndexCache SHALL 为进程内内存缓存，不持久化到磁盘，且在扩展停用时随进程释放。
+7. THE 缓存的存在 SHALL NOT 改变搜索、最近列表、附件过滤在相同输入下的可观察结果（缓存仅影响性能，不影响正确性）。

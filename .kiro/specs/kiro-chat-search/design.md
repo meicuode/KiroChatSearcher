@@ -162,7 +162,7 @@ export function checkEnvironment(deps?: EnvCheckerDeps): EnvCheck;
 
 ### SearchEngine（`src/search.ts`）
 
-保留现有签名，行为不变。
+在保留现有 `searchSessionsInDir` / `listRecentSessions` 对外行为的基础上，引入 `SessionIndexCache` 与附件标记。
 
 ```ts
 export interface SearchHit {
@@ -170,7 +170,20 @@ export interface SearchHit {
   title: string;
   modified: number;
   snippet: string;
-  matchField: 'title' | 'message';
+  matchField: 'title' | 'message' | 'recent';
+  hasImage: boolean;        // 会话是否含内嵌图片
+  hasAttachment: boolean;   // 会话是否含非空 contextItems 附件
+}
+
+/** 进程内会话索引缓存条目（不含原始 JSON，仅保留匹配所需的精简数据） */
+interface SessionIndexEntry {
+  sessionId: string;
+  mtimeMs: number;
+  title: string;
+  text: string;             // 已剔除 base64 图片的可匹配纯文本
+  firstUserText: string;    // 最近列表的预览来源
+  hasImage: boolean;
+  hasAttachment: boolean;
 }
 
 export function searchSessionsInDir(
@@ -178,18 +191,26 @@ export function searchSessionsInDir(
   keyword: string,
   limit?: number, // 默认 10
 ): SearchHit[];
+
+export function listRecentSessions(
+  dir: string,
+  limit?: number, // 默认 20
+): SearchHit[];
 ```
 
-职责对应需求：Requirement 4.\*、Requirement 5.\*。
+职责对应需求：Requirement 4.\*、Requirement 5.\*、Requirement 12.1–12.4、Requirement 13.\*。
 
 关键实现要点：
 
-- 关键词预处理：`escapeRegExp` 后用 `new RegExp(escaped, 'i')` 实现不区分大小写子串匹配。
-- 标题优先：先用 `title || name` 字段做匹配；命中则 `snippet = title`，`matchField = 'title'`。
-- 标题未命中再扫描消息：通过 `findMessageSnippet` 兼容多种消息结构（`obj.history[].message.content` 字符串/数组、`obj.messages[].content` 字符串/数组、`obj.messages[].text`），命中后用 `makeSnippet(text, idx, span=80)` 截取上下文，前后各 80 字符，连续空白折叠为单个空格，前后用 `…` 标识截断。
-- 排序：按 `stat.mtimeMs` 倒序。
-- 限流：`out.slice(0, limit)`。
-- 容错：读取目录、`stat`、`readFileSync`、`JSON.parse` 任意失败都跳过当前文件，不抛出。
+- **缓存读取统一入口**：新增内部函数 `loadIndex(dir)`，负责 `readdir` 目录、对每个 `.json` 文件按 `mtimeMs` 比对缓存：命中且 mtime 未变 → 复用缓存条目（不 `readFileSync` / 不 `JSON.parse`）；未命中或 mtime 变化 → 解析文件、构建 `SessionIndexEntry` 并写回缓存。`loadIndex` 还负责清理"缓存中存在但目录下已消失"的条目。
+- **解析时即提取**：解析一个文件时一次性算出 `title`、可匹配 `text`、`firstUserText`、`hasImage`、`hasAttachment`，存入缓存条目。`searchSessionsInDir` 与 `listRecentSessions` 都基于 `loadIndex` 的输出，不再各自重复解析。
+- **base64 剔除**：构建 `text` 时跳过 `imageUrl` / `image` / `data:` URL 这类内嵌二进制，避免把上万字符的 base64 纳入匹配文本与内存（Requirement 13.5）。
+- **图片检测短路**：扫描消息 content 时一旦遇到 `type` 含 `image` 或带 `imageUrl` 字段即置 `hasImage=true` 并停止图片扫描，不读取 base64 内容（Requirement 12.3）。
+- **附件检测**：任一消息项 `contextItems` 为非空数组即 `hasAttachment=true`（Requirement 12.2）。
+- 关键词匹配、标题优先、snippet 截取、`mtimeMs` 倒序、`limit` 截断、单文件容错等既有行为保持不变。
+- **缓存为进程内内存缓存**（模块级 `Map`），不持久化；扩展停用随进程释放（Requirement 13.6）。缓存只影响性能、不改变相同输入的可观察结果（Requirement 13.7）。
+
+- **AttachmentFilter（全部 / 仅含图片 / 仅含附件）由 Webview 前端在 `SearchHit[]` 上做内存过滤**。切换过滤 tab 时，前端先在已有数据上即时过滤渲染，同时发 `revalidate` 请求 Host 按当前关键词重新取数；Host 重读经过 `(mtime, size)` 缓存，仅重解析变化的文件，再把最新结果推回前端二次渲染。这样过滤始终作用于最新会话数据（含面板打开后新增的对话），同时避免无谓的全量重解析。SearchEngine 只负责把 `hasImage` / `hasAttachment` 算准并随结果返回。
 
 ### JumpCommandResolver（新模块 `src/jump.ts`）
 
@@ -301,10 +322,33 @@ interface SearchHit {
   sessionId: string;                  // 文件名去掉 .json 后的部分
   title: string;                      // 优先 obj.title，其次 obj.name；都没有则 'Untitled'
   modified: number;                   // 文件 mtimeMs，用于排序与展示
-  snippet: string;                    // title 命中 → 即标题；message 命中 → 上下文片段
-  matchField: 'title' | 'message';    // 命中字段
+  snippet: string;                    // title 命中 → 即标题；message 命中 → 上下文片段；recent → 首条用户消息预览
+  matchField: 'title' | 'message' | 'recent';  // 命中字段；recent 表示无关键词的最近列表项
+  hasImage: boolean;                  // 会话是否含内嵌图片（content[].type~image 或 imageUrl）
+  hasAttachment: boolean;             // 会话是否含非空 contextItems 附件
 }
 ```
+
+### SessionIndexEntry（缓存条目）
+
+```ts
+interface SessionIndexEntry {
+  sessionId: string;
+  mtimeMs: number;        // 失效依据之一：与磁盘 mtime 比对
+  size: number;           // 失效依据之二：与磁盘文件字节大小比对
+  title: string;
+  text: string;           // 用于关键词匹配的纯文本，已剔除 base64 图片数据
+  firstUserText: string;  // 最近列表的预览来源
+  hasImage: boolean;
+  hasAttachment: boolean;
+}
+```
+
+约束：
+
+- 缓存键为 SessionFile 绝对路径，值为 `SessionIndexEntry`；模块级 `Map`，进程内存活。
+- 失效判据为 `(mtimeMs, size)` 二元组：任一变化即重新解析。仅用 mtime 存在"同毫秒内二次写入不被察觉"的理论缝隙，叠加 size 后，内容增长（size 必变）能稳定触发刷新。
+- 同一 `(dir, keyword, limit)` 输入在缓存命中与未命中时返回的 `SearchHit[]` 必须完全一致（缓存不改变可观察结果）。
 
 ### SessionFile（输入数据，TS 描述兼容形态）
 
@@ -331,16 +375,18 @@ type ContentPart = string | { text?: string };
 | --- | --- | --- | --- |
 | Webview → Host | `ready` | — | 面板就绪，请求初始环境状态 |
 | Webview → Host | `search` | `{ keyword: string }` | 触发一次搜索（已被 120ms 防抖） |
+| Webview → Host | `revalidate` | — | 请求按当前关键词重新取数（切换过滤 tab 时发出，确保过滤作用于最新数据） |
 | Webview → Host | `open` | `{ sessionId: string }` | 请求跳转到对应会话 |
 | Webview → Host | `close` | — | 用户按 Esc，请求关闭面板 |
 | Host → Webview | `status` | `{ text: string; error?: boolean }` | 显示状态 / 错误条 |
-| Host → Webview | `results` | `{ results: SearchHit[]; keyword: string }` | 搜索结果 |
+| Host → Webview | `results` | `{ results: SearchHit[]; keyword: string }` | 搜索结果或最近列表；每项含 `hasImage` / `hasAttachment` 供 UI 过滤 |
 | Host → Webview | `focus` | — | 让搜索框聚焦并选中已有文本 |
 
 约束：
 
 - Host → Webview 的 `results.keyword` 一定是经过 `trim()` 的实际查询字符串，用于前端高亮。
 - Webview → Host 的所有字段都视为不可信，Host 必须 `String(...)` 强制转换并自行 `trim` / 校验。
+- **AttachmentFilter（全部 / 仅含图片 / 仅含附件）由 Webview 前端在已收到的 `SearchHit[]` 上过滤渲染**。切换过滤 tab 时前端先即时过滤（即时反馈），并发送 `revalidate` 让 Host 按当前关键词重新取数；Host 推回最新 `results` 后前端在新数据上再次应用过滤模式（Requirement 12.7）。切换关键词时 Host 也会重新推送 `results`，前端同样在新结果上应用当前过滤（Requirement 12.8）。面板/视图重新可见时 Host 主动 `refresh` 一次（Requirement 12.10）。
 
 ## Key Flows
 
@@ -517,6 +563,30 @@ sequenceDiagram
 
 > 说明：Property 11 的可测性依赖将 `highlight` 函数从 `webview.ts` 的内联脚本中抽到 `src/webview/format.ts`（见 Components 节），以便在 vitest 下直接 import。
 
+### Property 12: 图片检测正确且不依赖 base64 内容
+
+*For any* 由若干消息构成的 SessionFile：当且仅当存在某条消息的 `content` 数组项满足"`type` 含 `image`（大小写无关）或带 `imageUrl` / `image` 字段"时，该会话解析得到的 `hasImage === true`；否则 `hasImage === false`。且对任意长度的内嵌 base64 数据，检测结果只取决于该标志字段是否存在，不取决于 base64 字符串内容或长度。
+
+**Validates: Requirements 12.1, 12.3**
+
+### Property 13: 附件检测等价于存在非空 contextItems
+
+*For any* SessionFile：当且仅当存在某个消息项的 `contextItems` 为长度 ≥ 1 的数组时，`hasAttachment === true`；空数组、缺失字段或非数组一律得到 `hasAttachment === false`。
+
+**Validates: Requirements 12.2**
+
+### Property 14: AttachmentFilter 过滤的幂等与子集性
+
+*For any* `SearchHit[]` 结果集 `R` 与过滤模式 `m ∈ { all, image, attachment }`，过滤函数 `applyFilter(R, m)` 满足：(a) 输出是 `R` 的子序列（保持原有顺序、不新增项）；(b) `m === 'all'` 时输出等于 `R`；(c) `m === 'image'` 时输出恰为 `R` 中所有 `hasImage === true` 的项；`m === 'attachment'` 时恰为所有 `hasAttachment === true` 的项；(d) 幂等：`applyFilter(applyFilter(R, m), m)` 等于 `applyFilter(R, m)`。
+
+**Validates: Requirements 12.6, 12.8**
+
+### Property 15: 缓存不改变可观察结果
+
+*For any* 在临时目录中构造的 SessionFile 集合与任意关键词 `k`：连续两次调用 `searchSessionsInDir(dir, k, limit)`（第二次走缓存命中路径，期间不修改任何文件）返回的 `SearchHit[]` 完全相等（同序、同字段值，含 `hasImage` / `hasAttachment`）。进一步地，向其中一个会话**追加内容并写回**（mtime 与 size 至少其一变化）后再次调用，返回结果 SHALL 反映追加后的内容（缓存按 `(mtime, size)` 失效）。
+
+**Validates: Requirements 13.2, 13.3, 13.7**
+
 ## Error Handling
 
 错误处理遵循"按层就近、向上传递结构化结果，UI 统一渲染中文友好提示"原则。
@@ -532,7 +602,9 @@ sequenceDiagram
 | 多个异常并存 | `EnvChecker` | 按 Requirement 7.5 顺序返回**第一个**：UserDataDir → SessionsRoot → 无工作区 → WorkspaceSessionDir |
 | `readdir(workspaceDir)` 失败 | `SearchEngine` | `try/catch` 后返回 `[]` |
 | 单个文件 `stat` / `readFileSync` 失败 | `SearchEngine` | `try/catch` 后 `continue`，跳过该文件 |
-| 单个文件 `JSON.parse` 失败 | `SearchEngine` | `try/catch` 后 `continue`，**不冒泡到 UI**（Requirement 7.7） |
+| 单个文件 `JSON.parse` 失败 | `SearchEngine` | `try/catch` 后 `continue`，**不冒泡到 UI**（Requirement 7.7），且不写入缓存 |
+| 提取 `hasImage` / `hasAttachment` / 文本时字段形态异常 | `SearchEngine` | duck-typing 防御：非数组 / 缺字段一律视为 `false` / 空文本，不抛出 |
+| AttachmentFilter 过滤后结果为空 | Webview UI | 显示"没有符合条件的对话"状态提示，非错误（Requirement 12.9） |
 | `searchSessionsInDir` 抛出未预期异常 | `SearchPanel.runSearch` | `try/catch` 后向 Webview 发送 `{type:'status', text:'搜索失败：'+e.message, error:true}` |
 | 跳转命令均不可用 | `JumpCommandResolver` | 调用 `vscode.window.showErrorMessage`，文案同时包含 `kiroAgent.viewSpecSession` 与 `kiroAgent.openChatSession` |
 | 跳转命令抛出异常 | `JumpCommandResolver` | 静默回退到下一候选；全部失败再走"均不可用"分支 |
@@ -572,8 +644,10 @@ flowchart LR
 tests/
   paths.spec.ts            # PathResolver：1.1~1.6, 2.1~2.6（EXAMPLE 部分）
   paths.property.spec.ts   # PBT：Property 1, 2, 3, 4, 5
-  search.spec.ts           # SearchEngine：4.4, 4.7, 5.1~5.5, 4.4 多结构兼容
-  search.property.spec.ts  # PBT：Property 6, 7, 8, 9
+  search.spec.ts           # SearchEngine：4.4, 4.7, 5.1~5.5, 多结构兼容, 最近列表, 附件/图片标记, 缓存
+  search.property.spec.ts  # PBT：Property 6, 7, 8, 9, 12, 13, 15
+  filter.spec.ts           # AttachmentFilter 过滤纯函数 EXAMPLE
+  filter.property.spec.ts  # PBT：Property 14
   env.spec.ts              # EnvChecker：7.1~7.4 表驱动 EXAMPLE
   env.property.spec.ts     # PBT：Property 10
   jump.spec.ts             # JumpCommandResolver：9.1~9.5, 7.8 表驱动 EXAMPLE
