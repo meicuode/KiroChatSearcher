@@ -116,4 +116,14 @@ describe('resolveWorkspaceSessionDir', () => {
     const found = resolveWorkspaceSessionDir(root, '/no/such/workspace');
     expect(found).toBeNull();
   });
+
+  it('回归：路径长度非 3 字节倍数时 base64 padding 必须替换为 _ 而非删除', () => {
+    // 这两条来自真实的 Kiro 磁盘存储（regression for ERP-OMS-Workspaces 案例）：
+    // d:\jst\s3project\oms（20 字节，1 个 = padding）→ 末尾应为单个 _
+    // d:\SurErp\ERP-OMS-Workspaces（28 字节，2 个 = padding）→ 末尾应为双 _
+    const onePad = encodeWorkspaceKeys('d:\\jst\\s3project\\oms')[0];
+    const twoPad = encodeWorkspaceKeys('d:\\SurErp\\ERP-OMS-Workspaces')[0];
+    expect(onePad).toBe('ZDpcanN0XHMzcHJvamVjdFxvbXM_');
+    expect(twoPad).toBe('ZDpcU3VyRXJwXEVSUC1PTVMtV29ya3NwYWNlcw__');
+  });
 });

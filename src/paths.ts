@@ -110,12 +110,20 @@ export function encodeWorkspaceKeys(workspacePath: string): string[] {
   return [...new Set(keys)];
 }
 
+/**
+ * Kiro 实际使用的 base64url 变体：
+ *   base64(utf8(s))，把 '+' 替换为 '-'，把 '/' 替换为 '_'，
+ *   并把 '=' padding **保留**（替换为 '_'）。
+ *
+ * 之前实现把 '=' 直接删掉，对长度恰为 3 字节倍数的路径恰好等价（无 padding），
+ * 但路径长度 mod 3 != 0 时会少 1~2 个尾部下划线，导致目录匹配失败。
+ */
 function encodeBase64Url(s: string): string {
   return Buffer.from(s, 'utf8')
     .toString('base64')
-    .replace(/=/g, '')
     .replace(/\+/g, '-')
-    .replace(/\//g, '_');
+    .replace(/\//g, '_')
+    .replace(/=/g, '_');
 }
 
 /**
