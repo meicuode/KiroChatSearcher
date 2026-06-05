@@ -70,7 +70,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     border-color: var(--vscode-focusBorder);
     box-shadow: 0 0 0 1px var(--vscode-focusBorder);
   }
-  .search-box svg {
+  .search-box svg.icon {
     width: 16px;
     height: 16px;
     opacity: .7;
@@ -86,6 +86,25 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     font-size: 13px;
     height: 100%;
   }
+  .clear-btn {
+    flex-shrink: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    margin-left: 6px;
+    border-radius: 50%;
+    cursor: pointer;
+    opacity: .6;
+    transition: opacity .12s ease, background .12s ease;
+  }
+  .clear-btn:hover {
+    opacity: 1;
+    background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.2));
+  }
+  .clear-btn svg { width: 12px; height: 12px; }
+  .search-box.has-text .clear-btn { display: inline-flex; }
   .meta {
     font-size: 11px;
     opacity: .65;
@@ -222,10 +241,15 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
 </head>
 <body>
   <div class="search-box">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
     </svg>
     <input id="q" type="text" placeholder="搜索当前项目的 Kiro 对话…" autocomplete="off" spellcheck="false" />
+    <span id="clear" class="clear-btn" title="清空（Esc）" role="button" aria-label="清空">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <path d="M5 5l14 14M19 5L5 19"/>
+      </svg>
+    </span>
   </div>
   <div id="status" class="meta">输入关键词开始搜索…</div>
   <div class="filters">
@@ -241,6 +265,8 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   const $status = document.getElementById('status');
   const $results = document.getElementById('results');
   const $filters = document.querySelectorAll('.filter-chip');
+  const $clear = document.getElementById('clear');
+  const $searchBox = document.querySelector('.search-box');
   let activeIndex = -1;
   let rawResults = [];        // Host 推送的原始结果（未过滤）
   let currentResults = [];    // 当前展示的结果（已应用 AttachmentFilter）
@@ -249,6 +275,21 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   let debounceTimer;
 
   ${injectedFormatScript()}
+
+  /** 同步清空按钮显隐：输入框有内容时才显示 */
+  function syncClearVisibility() {
+    if ($q.value) $searchBox.classList.add('has-text');
+    else $searchBox.classList.remove('has-text');
+  }
+
+  /** 清空输入框并立即回到“最近列表” */
+  function clearInput() {
+    $q.value = '';
+    syncClearVisibility();
+    clearTimeout(debounceTimer);
+    vscode.postMessage({ type: 'search', keyword: '' });
+    $q.focus();
+  }
 
   /** 在原始结果上应用当前附件过滤，并刷新列表与状态条 */
   function applyAndRender() {
@@ -329,11 +370,14 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
 
   $q.addEventListener('input', () => {
     clearTimeout(debounceTimer);
+    syncClearVisibility();
     const kw = $q.value;
     debounceTimer = setTimeout(() => {
       vscode.postMessage({ type: 'search', keyword: kw });
     }, 120);
   });
+
+  $clear.addEventListener('click', clearInput);
 
   $q.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') {
@@ -352,7 +396,13 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
       e.preventDefault();
       if (activeIndex >= 0) open(activeIndex);
     } else if (e.key === 'Escape') {
-      vscode.postMessage({ type: 'close' });
+      // 有内容先清空（不关面板）；已为空再请求关闭
+      if ($q.value) {
+        e.preventDefault();
+        clearInput();
+      } else {
+        vscode.postMessage({ type: 'close' });
+      }
     }
   });
 

@@ -242,6 +242,9 @@ class SearchPanel {
  * 使用与居中面板完全相同的 Webview HTML 与消息协议。
  */
 class EntryViewProvider implements vscode.WebviewViewProvider {
+  /** 记录视图当前是否可见，供 toggle 命令决定“聚焦”还是“收起” */
+  static visible = false;
+
   constructor(private readonly extensionUri: vscode.Uri) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -254,8 +257,10 @@ class EntryViewProvider implements vscode.WebviewViewProvider {
 
     const session = new SearchSession(view.webview);
     view.onDidDispose(() => session.dispose());
+    EntryViewProvider.visible = view.visible;
     // 视图重新可见时刷新数据（侧边栏切走再切回 / 折叠展开）
     view.onDidChangeVisibility(() => {
+      EntryViewProvider.visible = view.visible;
       if (view.visible) session.refresh();
     });
   }
@@ -273,6 +278,17 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('kiroChatSearch.openSearch', () => {
       SearchPanel.showOrCreate(context);
+    })
+  );
+
+  // 折叠/展开：视图可见时收起侧边栏腾出编辑空间；不可见时聚焦本视图。
+  context.subscriptions.push(
+    vscode.commands.registerCommand('kiroChatSearch.toggleView', async () => {
+      if (EntryViewProvider.visible) {
+        await vscode.commands.executeCommand('workbench.action.toggleSidebarVisibility');
+      } else {
+        await vscode.commands.executeCommand('kiroChatSearch.entry.focus');
+      }
     })
   );
 

@@ -39,6 +39,10 @@
         "command": "kiroChatSearch.openSearch",
         "title": "Kiro: 搜索对话历史",
         "icon": "$(search)"
+      },
+      {
+        "command": "kiroChatSearch.toggleView",
+        "title": "Kiro: 折叠/展开对话搜索"
       }
     ],
     "menus": {
@@ -55,6 +59,11 @@
         "command": "kiroChatSearch.openSearch",
         "key": "ctrl+alt+k",
         "mac": "cmd+alt+k"
+      },
+      {
+        "command": "kiroChatSearch.toggleView",
+        "key": "ctrl+alt+j",
+        "mac": "cmd+alt+j"
       }
     ]
   },

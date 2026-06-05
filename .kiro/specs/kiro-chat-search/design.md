@@ -290,8 +290,10 @@ export function fmtTime(ms: number, now?: Date): string;
 - 内联 `<script>` 必须带 `nonce`。
 - 调用 `webview/format` 中的 `escapeHtml` / `highlight` 处理所有渲染到 DOM 的字符串（标题、snippet、关键词）。
 - 输入防抖：搜索框 `input` 事件 setTimeout 120ms。
-- 键盘交互：`ArrowUp` / `ArrowDown` 循环、`Enter` 打开、`Esc` 关闭。
+- 键盘交互：`ArrowUp` / `ArrowDown` 循环、`Enter` 打开、`Esc` 先清空（有内容时）否则关闭。
+- 清空按钮：搜索框右侧的 ✕，仅在输入框有内容时显示（`.search-box.has-text` 控制）；点击清空、聚焦并回到最近列表（复用 `search` 空关键词路径，不新增协议）。
 - 时间格式：今天 `今天 HH:mm`；同年 `MM-DD HH:mm`；跨年 `YYYY-MM-DD HH:mm`。
+- 折叠/展开：命令 `kiroChatSearch.toggleView`（`Ctrl+Alt+J` / `Cmd+Alt+J`）——视图可见时执行 `workbench.action.toggleSidebarVisibility` 收起侧边栏，不可见时执行 `kiroChatSearch.entry.focus` 聚焦展开。`EntryViewProvider` 用静态 `visible` 标记跟踪可见性（由 `onDidChangeVisibility` 维护）。
 
 ## Data Models
 

@@ -106,6 +106,7 @@ Kiro Chat Search 是一个运行在 Kiro（VSCode 衍生产品）中的扩展，
 5. THE SearchPanel SHALL 启用脚本（`enableScripts: true`），且在隐藏后保留上下文（`retainContextWhenHidden: true`）。
 6. THE SearchPanel SHALL 应用包含 `default-src 'none'` 与脚本 nonce 的 Content-Security-Policy。
 7. THE Extension SHALL 注册默认快捷键 `Ctrl+Alt+K`（Windows/Linux）与 `Cmd+Alt+K`（macOS）以触发 `kiroChatSearch.openSearch` 命令。
+8. THE Extension SHALL 注册命令 `kiroChatSearch.toggleView`（默认快捷键 `Ctrl+Alt+J` / `Cmd+Alt+J`）用于折叠/展开对话搜索：WHEN 搜索视图当前可见，THE Extension SHALL 收起侧边栏以腾出编辑空间；WHEN 搜索视图当前不可见，THE Extension SHALL 聚焦（展开）该视图。
 
 ### Requirement 7: 友好的错误提示
 
@@ -132,12 +133,13 @@ Kiro Chat Search 是一个运行在 Kiro（VSCode 衍生产品）中的扩展，
 2. WHEN 用户在搜索框按下 `ArrowDown` 键，THE SearchPanel SHALL 将选中项下移一项并循环到列表头部。
 3. WHEN 用户在搜索框按下 `ArrowUp` 键，THE SearchPanel SHALL 将选中项上移一项并循环到列表尾部。
 4. WHEN 用户按下 `Enter` 键且当前存在选中项，THE SearchPanel SHALL 触发打开该 SearchHit 对应会话。
-5. WHEN 用户按下 `Escape` 键，THE SearchPanel SHALL 关闭当前 Webview 面板。
+5. WHEN 用户按下 `Escape` 键：IF 搜索框当前有内容,THEN THE SearchPanel SHALL 先清空输入并回到最近列表（不关闭面板）；ELSE THE SearchPanel SHALL 关闭当前 Webview 面板。
 6. WHEN 用户用鼠标点击任一结果项，THE SearchPanel SHALL 触发打开该 SearchHit 对应会话。
 7. WHEN 选中项变化，THE SearchPanel SHALL 调用 `scrollIntoView({ block: 'nearest' })` 以保持选中项在可视区域内。
 8. WHEN SearchEngine 返回非空结果，THE SearchPanel SHALL 默认将选中项设为列表第一项。
 9. WHEN 渲染时间戳，THE SearchPanel SHALL 对当天会话使用 `今天 HH:mm` 格式，对当年其他日期使用 `MM-DD HH:mm` 格式，对跨年日期使用 `YYYY-MM-DD HH:mm` 格式。
 10. THE SearchPanel SHALL 在状态栏显示形如"命中 N 个对话（最多展示 10 条）"的命中数量提示。
+11. WHILE 搜索框有内容,THE SearchPanel SHALL 在输入框右侧显示清空（✕）按钮；WHEN 用户点击该按钮,THE SearchPanel SHALL 清空输入、聚焦输入框并回到最近列表。WHILE 搜索框为空,THE SearchPanel SHALL 隐藏该清空按钮。
 
 ### Requirement 9: 跳转到 Kiro 会话的命令调用
 
