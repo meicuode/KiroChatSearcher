@@ -2,6 +2,8 @@
 
 ![Kiro Chat Search 效果图](./kiro_chat_search.png)
 
+[![GitHub 仓库](https://img.shields.io/badge/GitHub-meicuode%2FKiroChatSearcher-181717?logo=github)](https://github.com/meicuode/KiroChatSearcher) · 作者 [@meicuode](https://github.com/meicuode) · MIT 许可
+
 在 Kiro（VSCode 衍生产品）中按关键词搜索**当前打开项目**的对话历史，点击结果直接跳转到对应会话。扩展自动识别本机 Kiro 用户数据目录与对话存储根目录，提供左侧活动栏入口与居中搜索面板，完全本地运行、零网络依赖。
 
 ## 功能概述
@@ -267,3 +269,13 @@ tests/                # vitest 单元测试与 fast-check 属性测试
 - 文件相关测试使用临时目录，测试结束自动清理
 - 8 条 Correctness Properties 以属性测试形式覆盖编码可逆性、路径变体覆盖、去重、命中、snippet 截取、排序限流、损坏容错与高亮包裹不变量
 - credit 解析单测覆盖：哈希值与真实 Kiro 安装核对一致、`usageSummary` 数组的字符串感知切取（含字符串内 `]` 不误截断）、按 `unit` 过滤求和、扁平/SAVES 子目录两种布局定位、LRU 淘汰后的回退（credit 缺失仍带上下文百分比）
+
+## 仓库与作者
+
+- **GitHub 仓库**：<https://github.com/meicuode/KiroChatSearcher>
+- **作者**：[@meicuode](https://github.com/meicuode)
+- **问题反馈 / 功能建议**：欢迎在 [Issues](https://github.com/meicuode/KiroChatSearcher/issues) 提交；Pull Request 同样欢迎。
+
+## 许可
+
+本项目以 [MIT License](./LICENSE) 开源。
