@@ -2,7 +2,12 @@
 
 ![Kiro Chat Search 效果图](./kiro_chat_search.png)
 
-[![GitHub 仓库](https://img.shields.io/badge/GitHub-meicuode%2FKiroChatSearcher-181717?logo=github)](https://github.com/meicuode/KiroChatSearcher) · 作者 [@meicuode](https://github.com/meicuode) · MIT 许可
+[![GitHub 仓库](https://img.shields.io/badge/GitHub-meicuode%2FKiroChatSearcher-181717?logo=github)](https://github.com/meicuode/KiroChatSearcher)
+[![CI](https://github.com/meicuode/KiroChatSearcher/actions/workflows/build.yml/badge.svg)](https://github.com/meicuode/KiroChatSearcher/actions/workflows/build.yml)
+[![最新 Release](https://img.shields.io/github/v/release/meicuode/KiroChatSearcher?sort=semver)](https://github.com/meicuode/KiroChatSearcher/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+
+作者 [@meicuode](https://github.com/meicuode)
 
 在 Kiro（VSCode 衍生产品）中按关键词搜索**当前打开项目**的对话历史，点击结果直接跳转到对应会话。扩展自动识别本机 Kiro 用户数据目录与对话存储根目录，提供左侧活动栏入口与居中搜索面板，完全本地运行、零网络依赖。
 
