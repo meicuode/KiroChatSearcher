@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { escapeHtml, highlight, fmtTime } from '../src/webview/format';
+import { escapeHtml, highlight, fmtTime, usageLabel } from '../src/webview/format';
 
 describe('escapeHtml', () => {
   it.each([
@@ -44,5 +44,32 @@ describe('highlight - 基础', () => {
     const out = highlight('<script>x</script>', 'script');
     expect(out).not.toContain('<script>');
     expect(out).toContain('<mark>script</mark>');
+  });
+});
+
+describe('usageLabel', () => {
+  it('有 credits 时优先展示 credit（<10 保留两位）', () => {
+    const r = usageLabel(0.1234, 80);
+    expect(r).not.toBeNull();
+    expect(r!.text).toBe('💳 0.12');
+    expect(r!.title).toContain('0.1234');
+  });
+
+  it('credits >= 10 保留一位', () => {
+    expect(usageLabel(14.39)!.text).toBe('💳 14.4');
+  });
+
+  it('credits=0 仍展示（区别于无数据）', () => {
+    expect(usageLabel(0)!.text).toBe('💳 0.00');
+  });
+
+  it('无 credits 时回退上下文百分比（四舍五入）', () => {
+    const r = usageLabel(undefined, 42.5);
+    expect(r!.text).toBe('◷ 43%');
+    expect(r!.title).toContain('42.5');
+  });
+
+  it('两者都无返回 null', () => {
+    expect(usageLabel(undefined, undefined)).toBeNull();
   });
 });

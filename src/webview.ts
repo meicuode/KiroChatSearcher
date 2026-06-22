@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { escapeHtml, escapeRegExp, highlight, fmtTime } from './webview/format';
+import { escapeHtml, escapeRegExp, highlight, fmtTime, usageLabel } from './webview/format';
 import { applyAttachmentFilter } from './webview/filter';
 
 /**
@@ -12,6 +12,7 @@ function injectedFormatScript(): string {
     escapeRegExp.toString(),
     highlight.toString(),
     fmtTime.toString(),
+    usageLabel.toString(),
     applyAttachmentFilter.toString(),
   ].join('\n');
 }
@@ -206,6 +207,15 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     margin-right: 2px;
     opacity: .85;
   }
+  .badge.usage {
+    font-variant-numeric: tabular-nums;
+    background: var(--vscode-badge-background, rgba(127,127,127,.18));
+    color: var(--vscode-badge-foreground, inherit);
+    border-radius: 6px;
+    padding: 0 5px;
+    margin-right: 6px;
+    opacity: .9;
+  }
   .snippet {
     font-size: 12px;
     opacity: .8;
@@ -328,10 +338,14 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
       const badges =
         (r.hasImage ? '<span class="badge" title="含图片">🖼 </span>' : '') +
         (r.hasAttachment ? '<span class="badge" title="含附件">📎 </span>' : '');
+      const usage = usageLabel(r.credits, r.contextPercentage);
+      const usageBadge = usage
+        ? '<span class="badge usage" title="' + escapeHtml(usage.title) + '">' + escapeHtml(usage.text) + '</span>'
+        : '';
       li.innerHTML =
         '<div class="row1">' +
           '<div class="title">' + highlight(r.title || 'Untitled', keyword) + '</div>' +
-          '<div class="time">' + badges + fmtTime(r.modified) + '</div>' +
+          '<div class="time">' + usageBadge + badges + fmtTime(r.modified) + '</div>' +
         '</div>' +
         '<div class="snippet">' + highlight(r.snippet || '', keyword) + '</div>';
       li.addEventListener('click', () => { activeIndex = i; updateActive(); open(i); });

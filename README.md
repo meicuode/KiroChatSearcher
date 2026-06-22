@@ -10,6 +10,7 @@
 - 自动定位**当前工作区**对应的会话子目录，搜索默认只覆盖当前项目
 - 左侧活动栏入口，点击即可在编辑器中央打开搜索面板
 - 实时搜索（同时覆盖会话标题与消息内容），最多展示 10 条结果，按修改时间倒序
+- 每条结果显示该对话的**真实 credit 消耗**（来自 Kiro 执行记录），查不到时回退展示上下文占用百分比
 - 命中关键词高亮显示、上下键选择、Enter 跳转、Esc 关闭、120ms 输入防抖
 - 完整的环境校验和友好的中文错误提示
 - 安全：Webview 使用 `default-src 'none'` + nonce 的 CSP，所有动态内容经 HTML 转义
@@ -51,6 +52,50 @@
 - 后续搜索 / 过滤 / 最近列表只对 `mtime` 或文件大小 `size` 发生变化的文件重新解析，未变更的直接复用缓存（仍在增长的对话因 mtime 与 size 都会变化，能稳定刷新）
 - 文件被删除时对应缓存条目自动清理；缓存仅存于内存，扩展停用即释放
 - 缓存只影响性能，**不改变相同输入下的搜索结果**
+
+## 对话 credit 消耗
+
+每条搜索结果的右上角会显示该对话的用量角标：
+
+- **`💳 70.31`**：该对话的**真实 credit 消耗**（hover 可见四位精度）。这是 Kiro 计费口径的权威值，由服务端返回，不是本地估算。
+- **`◷ 24%`**：当真实 credit 不可用时的**回退**，展示会话的上下文窗口占用百分比（Kiro 本地估算，写在会话 JSON 顶层的 `contextUsagePercentage`）。
+- 两者都拿不到时不显示角标。
+
+### credit 数据从哪来
+
+Kiro **不会**把 credit 写进对话历史 JSON——会话文件里只保留对 `executionId`（每一轮 agent 执行的 ID）的引用。真正的用量存在一份**独立的执行存档**里，由 Kiro 扩展的 `ExecutionLogController` 通过 `WriteBackCache` 落盘：
+
+```
+<UserData>/User/globalStorage/kiro.kiroagent/<workspaceId>/[<hash("KIRO::EXECUTION::SAVES")>/]<hash(executionId)>
+```
+
+- 目录名与文件名都是 **`sha256(key)` 十六进制的前 32 位**（见下方算法），与 Kiro storage 的路径哈希实现完全一致。
+- 每个执行存档是一份 JSON，含 `usageSummary` 数组，credit 项形如：
+
+  ```json
+  { "usage": 0.00972499529021559, "unit": "credit", "unitPlural": "credits" }
+  ```
+
+  数组里还会混入 `{ "usedTools": [...] }` 等非 credit 项，需按 `unit === "credit"` 过滤。
+- 该存档是 **LRU 缓存（上限约 500 条执行）**，较老的执行会被淘汰，因此并非所有历史对话都还查得到 credit——这也是回退到上下文百分比的原因。
+
+### credit 计算算法
+
+扩展按以下步骤汇总单个对话的 credit（实现见 `src/credits.ts`）：
+
+1. **取 executionId**：解析会话 JSON 的 `history` / `messages`，收集每个条目的 `executionId`（去重）。
+2. **定位执行存档**：对每个 `executionId` 计算
+
+   ```
+   fileName = sha256(executionId).toString("hex").slice(0, 32)
+   ```
+
+   在执行存储根目录下深度受限地扫描（跳过 `workspace-sessions` 与体量巨大的代码库索引子树），用 `文件名 → 绝对路径` 索引定位；未命中时强制重建一次索引重试（覆盖新产生的执行）。兼容两种布局：`<wsId>/<hash(eid)>` 与 `<wsId>/<hash(SAVES)>/<hash(eid)>`。
+3. **解析用量**：用**字符串感知的括号配对**只从原文切出 `"usageSummary": [...]` 数组文本（避免整体 `JSON.parse` 多 MB 的 `operations`），再解析该数组。
+4. **求和**：累加数组中所有 `unit === "credit"`（大小写不敏感）项的 `usage`，得到该执行的 credit；把会话引用的全部执行加总，即为该对话的总 credit 消耗。
+5. **缓存**：单个执行存档的解析结果按 `(mtime, size)` 缓存；执行存储目录的文件名索引带 4s 节流，避免每次输入都重扫磁盘。
+
+> 该汇总等同于把 Kiro 聊天界面里每一轮的 “Est. Credits Used” 相加。credit 只读不写，整个过程不联网。
 
 ## 跨平台路径规则
 
@@ -192,10 +237,11 @@ src/
   extension.ts        # 激活入口：命令注册、活动栏视图、居中搜索面板
   paths.ts            # PathResolver：跨平台路径解析与工作区编码
   env.ts              # EnvChecker：环境校验与错误优先级
-  search.ts           # SearchEngine：会话索引缓存、关键词匹配、附件/图片标记
+  search.ts           # SearchEngine：会话索引缓存、关键词匹配、附件/图片标记、credit 汇总
+  credits.ts          # CreditResolver：按 executionId 反查执行存档、汇总真实 credit 用量
   jump.ts             # JumpCommandResolver：跳转命令解析与回退
   webview.ts          # 搜索面板 HTML/CSS/JS 模板
-  webview/format.ts   # 与 webview 共享的纯函数（escapeHtml/highlight/fmtTime）
+  webview/format.ts   # 与 webview 共享的纯函数（escapeHtml/highlight/fmtTime/usageLabel）
   webview/filter.ts   # 与 webview 共享的附件过滤纯函数（applyAttachmentFilter）
 tests/                # vitest 单元测试与 fast-check 属性测试
 ```
@@ -207,3 +253,4 @@ tests/                # vitest 单元测试与 fast-check 属性测试
 - 跨平台路径解析通过可注入的 `deps`（platform / env / homedir / existsSync / statSync）测试，不污染全局 `process.platform`，也不读写真实的用户目录
 - 文件相关测试使用临时目录，测试结束自动清理
 - 8 条 Correctness Properties 以属性测试形式覆盖编码可逆性、路径变体覆盖、去重、命中、snippet 截取、排序限流、损坏容错与高亮包裹不变量
+- credit 解析单测覆盖：哈希值与真实 Kiro 安装核对一致、`usageSummary` 数组的字符串感知切取（含字符串内 `]` 不误截断）、按 `unit` 过滤求和、扁平/SAVES 子目录两种布局定位、LRU 淘汰后的回退（credit 缺失仍带上下文百分比）

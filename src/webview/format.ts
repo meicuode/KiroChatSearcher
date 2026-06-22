@@ -46,3 +46,31 @@ export function fmtTime(ms: number, now: Date = new Date()): string {
   }
   return d.getFullYear() + '-' + md + ' ' + hm;
 }
+
+/**
+ * 用量标签：优先展示真实 credit 消耗（来自 Kiro 执行记录的 usageSummary 汇总），
+ * credit 不可用时回退到上下文占用百分比（Kiro 本地估算）。两者都没有时返回 null。
+ * 返回 { text, title }，由调用方负责 HTML 转义后渲染为角标。
+ */
+export function usageLabel(
+  credits?: number,
+  contextPercentage?: number
+): { text: string; title: string } | null {
+  if (typeof credits === 'number' && isFinite(credits)) {
+    const v = credits >= 10 ? credits.toFixed(1) : credits.toFixed(2);
+    return {
+      text: '💳 ' + v,
+      title: '该对话实际消耗 ' + credits.toFixed(4) + ' credits（来自 Kiro 执行记录）',
+    };
+  }
+  if (typeof contextPercentage === 'number' && isFinite(contextPercentage)) {
+    return {
+      text: '◷ ' + Math.round(contextPercentage) + '%',
+      title:
+        '上下文窗口占用 ' +
+        contextPercentage.toFixed(1) +
+        '%（credit 数据不可用时的回退，Kiro 本地估算）',
+    };
+  }
+  return null;
+}

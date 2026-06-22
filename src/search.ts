@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { getCreditsForExecutions, storeRootFromSessionDir } from './credits';
 
 export interface SearchHit {
   sessionId: string;
@@ -12,6 +13,16 @@ export interface SearchHit {
   hasImage: boolean;
   /** 会话是否含非空 contextItems 附件 */
   hasAttachment: boolean;
+  /**
+   * 该会话的真实 credit 消耗（来自 Kiro 执行存档的 usageSummary 汇总）。
+   * 查不到执行存档（已被 LRU 淘汰 / 旧版本）时为 undefined。
+   */
+  credits?: number;
+  /**
+   * 会话上下文窗口占用百分比（Kiro 本地估算，写在会话 JSON 顶层）。
+   * 作为 credit 不可用时的回退展示。
+   */
+  contextPercentage?: number;
 }
 
 /**
@@ -31,6 +42,10 @@ interface SessionIndexEntry {
   firstUserText: string;
   hasImage: boolean;
   hasAttachment: boolean;
+  /** 该会话引用的所有 executionId（用于反查执行存档里的 credit 用量） */
+  executionIds: string[];
+  /** 会话顶层的上下文占用百分比（Kiro 本地估算），无则 undefined */
+  contextPercentage?: number;
 }
 
 /**
@@ -55,6 +70,7 @@ function parseSessionContent(obj: any): {
   firstUserText: string;
   hasImage: boolean;
   hasAttachment: boolean;
+  executionIds: string[];
 } {
   const items: any[] = [];
   if (Array.isArray(obj?.history)) items.push(...obj.history);
@@ -64,8 +80,17 @@ function parseSessionContent(obj: any): {
   let firstUserText = '';
   let hasImage = false;
   let hasAttachment = false;
+  const executionIds: string[] = [];
+  const seenExec = new Set<string>();
 
   for (const item of items) {
+    // 收集 executionId（落在 history 条目层级，常见于 assistant 轮次）
+    const eid = item?.executionId;
+    if (typeof eid === 'string' && eid && !seenExec.has(eid)) {
+      seenExec.add(eid);
+      executionIds.push(eid);
+    }
+
     // 附件：任一消息项的 contextItems 为非空数组
     if (!hasAttachment && Array.isArray(item?.contextItems) && item.contextItems.length > 0) {
       hasAttachment = true;
@@ -108,6 +133,7 @@ function parseSessionContent(obj: any): {
     firstUserText,
     hasImage,
     hasAttachment,
+    executionIds,
   };
 }
 
@@ -156,6 +182,8 @@ interface ResolvedSession {
   firstUserText: string;
   hasImage: boolean;
   hasAttachment: boolean;
+  executionIds: string[];
+  contextPercentage?: number;
 }
 
 /**
@@ -203,6 +231,10 @@ function loadIndex(dir: string): ResolvedSession[] {
         continue;
       }
       const parsed = parseSessionContent(obj);
+      const ctxPct =
+        typeof obj?.contextUsagePercentage === 'number'
+          ? obj.contextUsagePercentage
+          : undefined;
       entry = {
         sessionId: path.basename(f, '.json'),
         mtimeMs: stat.mtimeMs,
@@ -212,6 +244,8 @@ function loadIndex(dir: string): ResolvedSession[] {
         firstUserText: parsed.firstUserText,
         hasImage: parsed.hasImage,
         hasAttachment: parsed.hasAttachment,
+        executionIds: parsed.executionIds,
+        contextPercentage: ctxPct,
       };
       indexCache.set(full, entry);
     }
@@ -226,6 +260,8 @@ function loadIndex(dir: string): ResolvedSession[] {
       firstUserText: entry.firstUserText,
       hasImage: entry.hasImage,
       hasAttachment: entry.hasAttachment,
+      executionIds: entry.executionIds,
+      contextPercentage: entry.contextPercentage,
     });
   }
 
@@ -254,6 +290,7 @@ export function searchSessionsInDir(
 
   const entries = loadIndex(dir);
   const out: SearchHit[] = [];
+  const execIdsById = new Map<string, string[]>();
 
   for (const e of entries) {
     let snippet = '';
@@ -271,6 +308,7 @@ export function searchSessionsInDir(
     }
 
     if (matchField) {
+      execIdsById.set(e.sessionId, e.executionIds);
       out.push({
         sessionId: e.sessionId,
         title: e.title || 'Untitled',
@@ -279,12 +317,15 @@ export function searchSessionsInDir(
         matchField,
         hasImage: e.hasImage,
         hasAttachment: e.hasAttachment,
+        contextPercentage: e.contextPercentage,
       });
     }
   }
 
   out.sort((a, b) => b.modified - a.modified);
-  return out.slice(0, limit);
+  const limited = out.slice(0, limit);
+  attachCredits(dir, limited, execIdsById);
+  return limited;
 }
 
 export function makeSnippet(text: string, idx: number, span = 80): string {
@@ -305,10 +346,12 @@ export function listRecentSessions(dir: string, limit = 20): SearchHit[] {
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
   const out: SearchHit[] = [];
+  const execIdsById = new Map<string, string[]>();
   for (const e of entries.slice(0, limit)) {
     const snippet = e.firstUserText
       ? e.firstUserText.slice(0, 160).replace(/\s+/g, ' ').trim()
       : '';
+    execIdsById.set(e.sessionId, e.executionIds);
     out.push({
       sessionId: e.sessionId,
       title: e.title || 'Untitled',
@@ -317,9 +360,40 @@ export function listRecentSessions(dir: string, limit = 20): SearchHit[] {
       matchField: 'recent',
       hasImage: e.hasImage,
       hasAttachment: e.hasAttachment,
+      contextPercentage: e.contextPercentage,
     });
   }
+  attachCredits(dir, out, execIdsById);
   return out;
+}
+
+/**
+ * 为最终返回的结果集补充 credit 用量（只对有限的结果集做反查，避免全量扫描）。
+ * credit 取自 Kiro 执行存档；查不到（已被 LRU 淘汰 / 旧版本）则保持 undefined，
+ * 由上层回退展示 contextPercentage。任何异常都被吞掉，不影响搜索结果本身。
+ */
+function attachCredits(
+  dir: string,
+  hits: SearchHit[],
+  execIdsById: Map<string, string[]>
+): void {
+  if (!hits.length) return;
+  let storeRoot: string;
+  try {
+    storeRoot = storeRootFromSessionDir(dir);
+  } catch {
+    return;
+  }
+  for (const hit of hits) {
+    const ids = execIdsById.get(hit.sessionId);
+    if (!ids || ids.length === 0) continue;
+    try {
+      const { credits, found } = getCreditsForExecutions(storeRoot, ids);
+      if (found) hit.credits = credits;
+    } catch {
+      // 反查失败不影响结果展示
+    }
+  }
 }
 
 function escapeRegExp(s: string): string {
