@@ -51,21 +51,25 @@ describe('usageLabel', () => {
   it('有 credits 时优先展示 credit（<10 保留两位）', () => {
     const r = usageLabel(0.1234, 80);
     expect(r).not.toBeNull();
-    expect(r!.text).toBe('💳 0.12');
+    expect(r!.kind).toBe('credit');
+    expect(r!.value).toBe('0.12');
     expect(r!.title).toContain('0.1234');
   });
 
   it('credits >= 10 保留一位', () => {
-    expect(usageLabel(14.39)!.text).toBe('💳 14.4');
+    expect(usageLabel(14.39)!.value).toBe('14.4');
   });
 
   it('credits=0 仍展示（区别于无数据）', () => {
-    expect(usageLabel(0)!.text).toBe('💳 0.00');
+    const r = usageLabel(0)!;
+    expect(r.kind).toBe('credit');
+    expect(r.value).toBe('0.00');
   });
 
   it('无 credits 时回退上下文百分比（四舍五入）', () => {
     const r = usageLabel(undefined, 42.5);
-    expect(r!.text).toBe('◷ 43%');
+    expect(r!.kind).toBe('context');
+    expect(r!.value).toBe('43%');
     expect(r!.title).toContain('42.5');
   });
 

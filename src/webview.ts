@@ -236,12 +236,23 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     background: var(--vscode-badge-background, rgba(127,127,127,.18));
     color: var(--vscode-badge-foreground, inherit);
     border-radius: 6px;
-    padding: 1px 5px;
+    padding: 0 6px;
+    height: 17px;
     margin-right: 6px;
     opacity: .9;
     display: inline-flex;
     align-items: center;
+    gap: 3px;
+  }
+  .badge.usage svg {
+    width: 12px;
+    height: 12px;
+    display: block;
+    flex-shrink: 0;
+  }
+  .badge.usage .usage-val {
     line-height: 1;
+    display: block;
   }
   .snippet {
     font-size: 12px;
@@ -372,9 +383,16 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
         (r.hasImage ? '<span class="badge" title="含图片">🖼 </span>' : '') +
         (r.hasAttachment ? '<span class="badge" title="含附件">📎 </span>' : '');
       const usage = usageLabel(r.credits, r.contextPercentage);
-      const usageBadge = usage
-        ? '<span class="badge usage" title="' + escapeHtml(usage.title) + '">' + escapeHtml(usage.text) + '</span>'
-        : '';
+      let usageBadge = '';
+      if (usage) {
+        const icon = usage.kind === 'credit'
+          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg>'
+          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></svg>';
+        usageBadge =
+          '<span class="badge usage" title="' + escapeHtml(usage.title) + '">' +
+            icon + '<span class="usage-val">' + escapeHtml(usage.value) + '</span>' +
+          '</span>';
+      }
       li.innerHTML =
         '<div class="row1">' +
           '<div class="title">' + highlight(r.title || 'Untitled', keyword) + '</div>' +
