@@ -75,6 +75,12 @@ class SearchSession {
         // 前端切换过滤 tab 前请求刷新数据源
         this.runSearch(this.lastKeyword);
         break;
+      case 'hardRefresh':
+        // 前端点击刷新按钮：按当前关键词重新取数。
+        // 底层按 (mtime, size) 失效 + 未命中重扫目录，已能拿到磁盘最新状态与
+        // 最新 credit 统计，无需清空仍然有效的缓存。
+        this.runSearch(this.lastKeyword);
+        break;
       case 'open':
         this.openSession(String(msg.sessionId || ''));
         break;

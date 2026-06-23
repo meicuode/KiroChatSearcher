@@ -126,6 +126,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   }
   .filters {
     display: flex;
+    align-items: center;
     gap: 6px;
     padding: 0 2px;
   }
@@ -148,6 +149,27 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     border-color: var(--vscode-button-background);
     opacity: 1;
   }
+  .refresh-btn {
+    margin-left: auto;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    cursor: pointer;
+    opacity: .65;
+    transition: opacity .12s ease, background .12s ease;
+  }
+  .refresh-btn:hover {
+    opacity: 1;
+    background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.2));
+  }
+  .refresh-btn svg { width: 15px; height: 15px; }
+  .refresh-btn.spinning { opacity: 1; pointer-events: none; }
+  .refresh-btn.spinning svg { animation: kcs-spin .7s linear infinite; }
+  @keyframes kcs-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   .results {
     flex: 1;
     overflow-y: auto;
@@ -201,6 +223,8 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     font-size: 11px;
     opacity: .6;
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
   }
   .badge {
     font-size: 11px;
@@ -212,9 +236,12 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     background: var(--vscode-badge-background, rgba(127,127,127,.18));
     color: var(--vscode-badge-foreground, inherit);
     border-radius: 6px;
-    padding: 0 5px;
+    padding: 1px 5px;
     margin-right: 6px;
     opacity: .9;
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
   }
   .snippet {
     font-size: 12px;
@@ -266,6 +293,11 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     <span class="filter-chip active" data-mode="all">全部</span>
     <span class="filter-chip" data-mode="image">🖼 含图片</span>
     <span class="filter-chip" data-mode="attachment">📎 含附件</span>
+    <span id="refresh" class="refresh-btn" title="刷新（重新统计最新结果与积分消耗）" role="button" aria-label="刷新">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
+      </svg>
+    </span>
   </div>
   <ul id="results" class="results"></ul>
 
@@ -276,6 +308,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   const $results = document.getElementById('results');
   const $filters = document.querySelectorAll('.filter-chip');
   const $clear = document.getElementById('clear');
+  const $refresh = document.getElementById('refresh');
   const $searchBox = document.querySelector('.search-box');
   let activeIndex = -1;
   let rawResults = [];        // Host 推送的原始结果（未过滤）
@@ -407,6 +440,13 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
 
   $clear.addEventListener('click', clearInput);
 
+  // 硬刷新：请求 host 按当前关键词重新取数（底层按 mtime/size 失效校验磁盘，
+  // 已能反映最新对话与 credit 统计，无需清缓存）。
+  $refresh.addEventListener('click', () => {
+    $refresh.classList.add('spinning');
+    vscode.postMessage({ type: 'hardRefresh' });
+  });
+
   $q.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
@@ -440,6 +480,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
       rawResults = m.results || [];
       currentKeyword = m.keyword || '';
       applyAndRender();
+      $refresh.classList.remove('spinning');
     } else if (m.type === 'status') {
       setStatus(m.text, m.error, m.title);
       if (m.error) {
@@ -447,6 +488,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
         rawResults = [];
         currentResults = [];
       }
+      $refresh.classList.remove('spinning');
     } else if (m.type === 'focus') {
       $q.focus();
       $q.select();
