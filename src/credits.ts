@@ -3,54 +3,74 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 
 /**
- * Kiro 把"每次执行（execution）"的用量摘要存在一份独立的磁盘缓存里，
- * 而不是写进会话历史 JSON。会话文件只保留对 executionId 的引用。
+ * Kiro 把"每次执行（execution）"的用量摘要存在独立的磁盘缓存里，而不是写进
+ * 会话历史 JSON。每个执行存档是一份 JSON，含 `chatSessionId`（该执行所属会话）与
+ * 末尾的 `usageSummary` 数组：
+ *   [{ "usage": 0.0097, "unit": "credit", "unitPlural": "credits" }, { "usedTools": [...] }, ...]
  *
- * 存储布局（逆向自 Kiro 扩展 `ExecutionLogController` + `WriteBackCache`）：
- *   <globalStorage>/kiro.kiroagent/<workspaceId>/[<hash(SAVES)>/]<hash(executionId)>
- * 其中：
- *   - 目录 / 文件名 = sha256(key) 的十六进制前 32 位（见 hash32）。
- *   - 每个执行存档是一份 JSON，含 usageSummary 数组：
- *       [{ "usage": 0.0097, "unit": "credit", "unitPlural": "credits" }, { "usedTools": [...] }, ...]
- *   - 该缓存是 LRU（上限约 500 条），较老的执行会被淘汰，因此并非所有
- *     历史会话都还能查到 credit。
+ * 关键关联方式（逆向自 Kiro 扩展）：
+ *  - 执行存储目录 = <globalStorage>/kiro.kiroagent/<workspaceId>/[<hash(SAVES)>/]<hash(executionId)>，
+ *    其中 workspaceId = sha256(工作区 fsPath) 十六进制前 32 位（见 ExecutionLogController）。
+ *  - 单个执行存档里的 `chatSessionId` 标明它属于哪个会话。
+ *  - 普通对话里 `history[].executionId` 直接指向带 usageSummary 的执行；但 **spec / checkpoint
+ *    会话**经 `migrateExecutionToSession` 迁移后，history 引用的是无 usageSummary 的记录，真正
+ *    的 credit 落在以 `chatSessionId` 标记的执行上。因此本模块统一按 `chatSessionId` 汇总，
+ *    比按 history 的 executionId 反查更稳。
  *
- * 本模块按 executionId 反查这些文件并汇总 credit 用量，只读不写。
+ * 该缓存为 LRU（约 500 条执行），旧执行会被淘汰。本模块只读不写。
  */
-
-/** Kiro 执行存储里 folderKey="KIRO::EXECUTION::SAVES" 的固定哈希子目录名。 */
-const SAVES_FOLDER_HASH = hash32('KIRO::EXECUTION::SAVES');
 
 /** sha256(s) 的十六进制前 32 位——与 Kiro storage 的路径哈希算法一致。 */
 export function hash32(s: string): string {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex').slice(0, 32);
 }
 
-/** 单个执行存档文件的解析缓存条目（按 mtime+size 失效）。 */
-interface FileCreditEntry {
+/**
+ * 由工作区 fsPath 生成执行存储目录名（workspaceId）的候选集合。
+ * Kiro 用 sha256(currentWorkspace.fsPath)；不同系统盘符大小写与斜杠方向有差异，
+ * 故对若干变体分别哈希，去重返回。
+ */
+export function workspaceIdCandidates(workspacePath: string): string[] {
+  const variants = new Set<string>();
+  const add = (p: string) => variants.add(p);
+  add(workspacePath);
+  if (/^[a-zA-Z]:/.test(workspacePath)) {
+    add(workspacePath[0].toUpperCase() + workspacePath.slice(1));
+    add(workspacePath[0].toLowerCase() + workspacePath.slice(1));
+  }
+  for (const v of [...variants]) {
+    add(v.replace(/\\/g, '/'));
+    add(v.replace(/\//g, '\\'));
+  }
+  return [...new Set([...variants].map(hash32))];
+}
+
+/** 读取大小：头部足够覆盖顶层 chatSessionId；尾部覆盖末尾 usageSummary。 */
+const HEAD_BYTES = 512 * 1024;
+const TAIL_BYTES = 128 * 1024;
+
+/** 单个执行存档的解析缓存条目（按 mtime+size 失效）。 */
+interface ArchiveEntry {
   mtimeMs: number;
   size: number;
-  credits: number;
+  chatSessionId: string | null;
+  credit: number;
+  hasUsage: boolean;
+  /** 该执行迁移历史中的祖先会话 id（checkpoint 链）。 */
+  parentSessionIds: string[];
 }
 
-/** executionId 文件解析缓存：键为文件绝对路径。 */
-const fileCreditCache = new Map<string, FileCreditEntry>();
+/** 执行存档解析缓存：键为文件绝对路径。 */
+const archiveCache = new Map<string, ArchiveEntry>();
 
-/** 执行存储目录的 文件名(hash) → 绝对路径 索引（一个 storeRoot 一份）。 */
-interface StoreIndex {
-  root: string;
-  builtAt: number;
-  map: Map<string, string>;
-}
-let storeIndex: StoreIndex | null = null;
-
-/** 索引重建节流：避免每次查询都重扫目录。 */
-const STORE_INDEX_TTL_MS = 4000;
+/** 目录扫描节流。scope 变化（切换工作区）或超时则重扫。 */
+let scanState: { scope: string; scannedAt: number } | null = null;
+const SCAN_TTL_MS = 4000;
 
 /** 测试辅助：清空所有进程内缓存。 */
 export function __clearCreditCacheForTest(): void {
-  fileCreditCache.clear();
-  storeIndex = null;
+  archiveCache.clear();
+  scanState = null;
 }
 
 /**
@@ -62,78 +82,36 @@ export function storeRootFromSessionDir(sessionDir: string): string {
 }
 
 const HEX32 = /^[0-9a-f]{32}$/;
+const CHAT_SESSION_RE = /"chatSessionId"\s*:\s*"([^"]+)"/;
+/** 锚定真正的 usageSummary 字段（键+冒号+数组），避免匹配正文里的词。 */
+const USAGE_KEY_RE = /"usageSummary"\s*:\s*\[/;
+const PARENT_IDS_RE = /"parentSessionIds"\s*:\s*\[([^\]]*)\]/;
 
-/**
- * 递归列出 storeRoot 下所有"32 位十六进制名"的文件（执行存档 / 元数据等）。
- * 深度受限以避开体量巨大的代码库索引子树；跳过 workspace-sessions。
- * 执行存档位于 <root>/<wsId>/<file>（深度 2）或 <root>/<wsId>/<hash(SAVES)>/<file>（深度 3）。
- */
-function listHexFiles(root: string, maxDepth = 3): Map<string, string> {
-  const map = new Map<string, string>();
-  const walk = (dir: string, depth: number) => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (depth < maxDepth && e.name !== 'workspace-sessions') {
-          walk(full, depth + 1);
-        }
-      } else if (HEX32.test(e.name) && !map.has(e.name)) {
-        // hash(executionId) 全局唯一，跨 workspaceId 不会真正冲突；保留首个即可。
-        map.set(e.name, full);
-      }
-    }
-  };
-  walk(root, 1);
-  return map;
-}
-
-/** 取得（必要时重建）storeRoot 的文件名索引。 */
-function getStoreIndex(root: string, forceRebuild = false): Map<string, string> {
-  const now = Date.now();
-  if (
-    !forceRebuild &&
-    storeIndex &&
-    storeIndex.root === root &&
-    now - storeIndex.builtAt < STORE_INDEX_TTL_MS
-  ) {
-    return storeIndex.map;
-  }
-  const map = listHexFiles(root);
-  storeIndex = { root, builtAt: now, map };
-  return map;
-}
-
-/** 在索引中定位某 executionId 对应的存档文件；未命中则强制重建一次再试。 */
-function locateExecutionFile(root: string, executionId: string): string | null {
-  const fileName = hash32(executionId);
-  let map = getStoreIndex(root);
-  let full = map.get(fileName);
-  if (full && fs.existsSync(full)) return full;
-
-  // 缓存未命中或文件已被移动：重建索引重试一次（覆盖新产生的执行）。
-  map = getStoreIndex(root, true);
-  full = map.get(fileName);
-  if (full && fs.existsSync(full)) return full;
-
-  // 兜底：直接按确定性子路径探测（部分版本固定使用 SAVES 子目录布局）。
-  return null;
+/** 从 "parentSessionIds":[...] 文本里抽出其中的字符串 id 列表。 */
+function extractParentSessionIds(raw: string): string[] {
+  const m = PARENT_IDS_RE.exec(raw);
+  if (!m) return [];
+  const ids: string[] = [];
+  const re = /"([^"]+)"/g;
+  let s: RegExpExecArray | null;
+  while ((s = re.exec(m[1])) !== null) ids.push(s[1]);
+  return ids;
 }
 
 /**
  * 从执行存档原文中切出 "usageSummary": [...] 的数组文本。
- * 用括号配对（字符串感知）扫描，避免把整份多 MB 的 operations 一起 JSON.parse。
+ * - 锚定 `"usageSummary"<空白>:<空白>[` 模式，避免匹配 operations 正文里出现的
+ *   "usageSummary" 词（如本类对话本身的存档）。
+ * - 取**最后一个**匹配：真正的顶层 usageSummary 字段在 operations 之后、接近文件末尾。
+ * - 括号配对（字符串感知）扫描，避免被字符串内的 ] 提前截断。
  */
 export function extractUsageSummaryArray(raw: string): string | null {
-  const ki = raw.indexOf('"usageSummary"');
-  if (ki < 0) return null;
-  const start = raw.indexOf('[', ki);
-  if (start < 0) return null;
+  const re = /"usageSummary"\s*:\s*\[/g;
+  let m: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((m = re.exec(raw)) !== null) last = m;
+  if (!last) return null;
+  const start = last.index + last[0].length - 1; // '[' 的位置
 
   let depth = 0;
   let inStr = false;
@@ -180,58 +158,263 @@ export function sumCreditsFromUsageSummary(arrayText: string): number {
   return sum;
 }
 
-/** 解析单个执行存档文件的 credit 用量（带 mtime/size 缓存）。 */
-function parseExecutionCredits(file: string): number {
-  let stat: fs.Stats;
+/** 读文件头部+尾部；若头部找不到 chatSessionId，则整读以确保可靠提取。 */
+function readForParse(file: string, size: number): { head: string; tail: string; full: string | null } {
+  if (size <= HEAD_BYTES + TAIL_BYTES) {
+    const all = fs.readFileSync(file, 'utf8');
+    return { head: all, tail: all, full: all };
+  }
+  const fd = fs.openSync(file, 'r');
   try {
-    stat = fs.statSync(file);
-  } catch {
-    return 0;
+    const headBuf = Buffer.allocUnsafe(HEAD_BYTES);
+    fs.readSync(fd, headBuf, 0, HEAD_BYTES, 0);
+    const tailBuf = Buffer.allocUnsafe(TAIL_BYTES);
+    fs.readSync(fd, tailBuf, 0, TAIL_BYTES, size - TAIL_BYTES);
+    return { head: headBuf.toString('utf8'), tail: tailBuf.toString('utf8'), full: null };
+  } finally {
+    fs.closeSync(fd);
   }
-  const cached = fileCreditCache.get(file);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-    return cached.credits;
-  }
-  let raw: string;
+}
+
+/** 解析单个执行存档，提取 chatSessionId 与 credit。 */
+function parseArchive(file: string, size: number): Omit<ArchiveEntry, 'mtimeMs' | 'size'> {
+  let head: string;
+  let tail: string;
+  let full: string | null;
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    ({ head, tail, full } = readForParse(file, size));
   } catch {
-    return 0;
+    return { chatSessionId: null, credit: 0, hasUsage: false, parentSessionIds: [] };
   }
-  const arrText = extractUsageSummaryArray(raw);
-  const credits = arrText ? sumCreditsFromUsageSummary(arrText) : 0;
-  fileCreditCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, credits });
-  return credits;
+
+  // chatSessionId：先头部，再尾部；仍找不到且是大文件，则整读兜底。
+  let chatSessionId: string | null = null;
+  let m = CHAT_SESSION_RE.exec(head);
+  if (!m && tail !== head) m = CHAT_SESSION_RE.exec(tail);
+  if (!m && full === null) {
+    try {
+      full = fs.readFileSync(file, 'utf8');
+      m = CHAT_SESSION_RE.exec(full);
+    } catch {
+      /* ignore */
+    }
+  }
+  if (m) chatSessionId = m[1];
+
+  // parentSessionIds（checkpoint 祖先链）位于顶部，随 chatSessionId 一并取。
+  const parentSource = full ?? head;
+  const parentSessionIds = extractParentSessionIds(parentSource);
+
+  // usageSummary 在文件末尾，通常落在尾部窗口内。
+  let credit = 0;
+  let hasUsage = false;
+  if (USAGE_KEY_RE.test(tail)) {
+    let arrText = extractUsageSummaryArray(tail);
+    if (arrText === null) {
+      // 字段存在但数组被尾部窗口截断（usageSummary 超大）→ 整读兜底。
+      if (full === null) {
+        try {
+          full = fs.readFileSync(file, 'utf8');
+        } catch {
+          /* ignore */
+        }
+      }
+      if (full) arrText = extractUsageSummaryArray(full);
+    }
+    if (arrText !== null) {
+      hasUsage = true;
+      credit = sumCreditsFromUsageSummary(arrText);
+    }
+  } else if (full && full !== tail && USAGE_KEY_RE.test(full)) {
+    const arrText = extractUsageSummaryArray(full);
+    if (arrText !== null) {
+      hasUsage = true;
+      credit = sumCreditsFromUsageSummary(arrText);
+    }
+  }
+  return { chatSessionId, credit, hasUsage, parentSessionIds };
+}
+
+/** 递归遍历一个目录，解析其中的 hex 命名执行存档（按 mtime/size 复用缓存）。 */
+function walkScope(dir: string, depth: number, maxDepth: number, seen: Set<string>): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (depth < maxDepth) walkScope(full, depth + 1, maxDepth, seen);
+    } else if (HEX32.test(e.name)) {
+      seen.add(full);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      const cached = archiveCache.get(full);
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) continue;
+      const parsed = parseArchive(full, stat.size);
+      archiveCache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, ...parsed });
+    }
+  }
+}
+
+/**
+ * 刷新执行存档索引。优先把扫描限定在当前工作区对应的 workspaceId 目录，
+ * 避免遍历其它工作区的大量大文件；定位不到时回退扫描整个 storeRoot。
+ */
+function refreshIndex(storeRoot: string, scopeDirs: string[], force = false): void {
+  const scope = scopeDirs.length ? scopeDirs.join('|') : storeRoot;
+  const now = Date.now();
+  if (!force && scanState && scanState.scope === scope && now - scanState.scannedAt < SCAN_TTL_MS) {
+    return;
+  }
+
+  const seen = new Set<string>();
+  if (scopeDirs.length) {
+    for (const d of scopeDirs) walkScope(d, 1, 2, seen);
+  } else {
+    // 回退：扫描整棵树（跳过 workspace-sessions）
+    const root = storeRoot;
+    const walkAll = (dir: string, depth: number) => {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          if (depth < 3 && e.name !== 'workspace-sessions') walkAll(full, depth + 1);
+        } else if (HEX32.test(e.name)) {
+          seen.add(full);
+          let stat: fs.Stats;
+          try {
+            stat = fs.statSync(full);
+          } catch {
+            continue;
+          }
+          const cached = archiveCache.get(full);
+          if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) continue;
+          archiveCache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, ...parseArchive(full, stat.size) });
+        }
+      }
+    };
+    walkAll(root, 1);
+  }
+
+  // 清理本次未见到、但属于本 scope 的旧条目
+  const prefixes = scopeDirs.length ? scopeDirs : [storeRoot];
+  for (const key of archiveCache.keys()) {
+    if (prefixes.some((p) => key.startsWith(p)) && !seen.has(key)) {
+      archiveCache.delete(key);
+    }
+  }
+
+  scanState = { scope, scannedAt: now };
 }
 
 /** 一个会话的 credit 汇总结果。 */
 export interface SessionCredits {
-  /** 命中的执行存档汇总出的总 credit。 */
+  /** 该会话所有执行存档汇总出的总 credit。 */
   credits: number;
-  /** 是否至少找到了一条执行存档（用于区分"0 credit"与"查不到数据"）。 */
+  /**
+   * 是否至少有一条该会话的执行存档**带 usageSummary 用量数据**。
+   * 用于区分"该对话确实消耗 0 credit"与"没记录用量 / 已被 LRU 淘汰"。
+   */
   found: boolean;
 }
 
+export interface CreditQueryOptions {
+  /** 当前工作区 fsPath，用于把扫描限定到对应的 workspaceId 目录（强烈建议传入）。 */
+  workspacePath?: string;
+  /**
+   * 是否纳入 checkpoint 祖先链的消耗（默认 true）。
+   * spec 的 checkpoint 会话会从父会话继承整段对话，其消耗记在父/祖先会话的 chatSessionId 下；
+   * 开启后会把祖先会话一并合计，得到整条对话的总消耗。
+   */
+  includeLineage?: boolean;
+  /**
+   * 该会话 history 引用的 executionId。checkpoint 会话的 history 引用的执行往往属于
+   * 祖先会话——据此把这些执行所属的 chatSessionId 并入 lineage（这是连接 checkpoint
+   * 与其源会话最可靠的线索）。
+   */
+  historyExecutionIds?: readonly string[];
+}
+
 /**
- * 汇总给定 executionId 列表对应的总 credit 用量。
- * @param storeRoot 执行存储根目录（kiroagent 目录），见 storeRootFromSessionDir。
- * @param executionIds 该会话引用的所有 executionId。
+ * 由目标会话出发求 lineage 会话集合：把 history 引用的执行所属的 chatSessionId 并入。
+ * 这是连接 checkpoint 会话与其源（祖先）会话最可靠的、有方向的线索——checkpoint 的
+ * history 引用的执行属于祖先会话，因此一层并入即可覆盖整条 lineage（history 通常已包含
+ * 各祖先轮次的执行）。不使用 parentSessionIds 做传递闭包，以免反向/跨链过度连接而高估。
+ * 返回包含目标自身的会话 id 集合。
  */
-export function getCreditsForExecutions(
+function lineageClosure(
+  seeds: Set<string>,
+  byName: Map<string, ArchiveEntry>,
+  historyExecutionIds?: readonly string[]
+): Set<string> {
+  const out = new Set(seeds);
+  if (historyExecutionIds) {
+    for (const eid of historyExecutionIds) {
+      const ent = byName.get(hash32(eid));
+      if (ent?.chatSessionId) out.add(ent.chatSessionId);
+    }
+  }
+  return out;
+}
+
+/**
+ * 汇总属于给定会话的总 credit 用量（按执行存档的 `chatSessionId` 匹配）。
+ * 默认纳入 checkpoint 祖先链（见 includeLineage / historyExecutionIds）。
+ * @param storeRoot kiroagent 目录，见 storeRootFromSessionDir。
+ * @param sessionIds 目标 sessionId 列表（通常一个）。
+ */
+export function getCreditsForSessions(
   storeRoot: string,
-  executionIds: readonly string[]
+  sessionIds: readonly string[],
+  opts: CreditQueryOptions = {}
 ): SessionCredits {
+  const seeds = new Set(sessionIds.filter(Boolean));
+  if (seeds.size === 0) return { credits: 0, found: false };
+
+  let scopeDirs: string[] = [];
+  if (opts.workspacePath) {
+    scopeDirs = workspaceIdCandidates(opts.workspacePath)
+      .map((id) => path.join(storeRoot, id))
+      .filter((d) => {
+        try {
+          return fs.statSync(d).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+  }
+
+  refreshIndex(storeRoot, scopeDirs);
+
+  let wanted: Set<string>;
+  if (opts.includeLineage === false) {
+    wanted = seeds;
+  } else {
+    // 文件名(hash(executionId)) → 条目，供 history executionId 反查所属会话
+    const byName = new Map<string, ArchiveEntry>();
+    for (const [p, e] of archiveCache) byName.set(path.basename(p), e);
+    wanted = lineageClosure(seeds, byName, opts.historyExecutionIds);
+  }
+
   let credits = 0;
   let found = false;
-  for (const eid of executionIds) {
-    if (!eid) continue;
-    const file = locateExecutionFile(storeRoot, eid);
-    if (!file) continue;
-    found = true;
-    credits += parseExecutionCredits(file);
+  for (const entry of archiveCache.values()) {
+    if (entry.chatSessionId && entry.hasUsage && wanted.has(entry.chatSessionId)) {
+      found = true;
+      credits += entry.credit;
+    }
   }
   return { credits, found };
 }
-
-/** 暴露给诊断/测试：SAVES 子目录哈希名。 */
-export const __SAVES_FOLDER_HASH = SAVES_FOLDER_HASH;

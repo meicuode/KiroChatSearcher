@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { getCreditsForExecutions, storeRootFromSessionDir } from './credits';
+import { getCreditsForSessions, storeRootFromSessionDir } from './credits';
 
 export interface SearchHit {
   sessionId: string;
@@ -42,10 +42,12 @@ interface SessionIndexEntry {
   firstUserText: string;
   hasImage: boolean;
   hasAttachment: boolean;
-  /** 该会话引用的所有 executionId（用于反查执行存档里的 credit 用量） */
-  executionIds: string[];
   /** 会话顶层的上下文占用百分比（Kiro 本地估算），无则 undefined */
   contextPercentage?: number;
+  /** 会话顶层的工作区 fsPath，用于把 credit 扫描限定到对应存储目录 */
+  workspacePath?: string;
+  /** 会话 history 引用的 executionId（用于 checkpoint lineage 追溯祖先会话） */
+  executionIds: string[];
 }
 
 /**
@@ -84,7 +86,7 @@ function parseSessionContent(obj: any): {
   const seenExec = new Set<string>();
 
   for (const item of items) {
-    // 收集 executionId（落在 history 条目层级，常见于 assistant 轮次）
+    // 收集 executionId（用于 checkpoint lineage：这些执行常属于祖先会话）
     const eid = item?.executionId;
     if (typeof eid === 'string' && eid && !seenExec.has(eid)) {
       seenExec.add(eid);
@@ -182,8 +184,9 @@ interface ResolvedSession {
   firstUserText: string;
   hasImage: boolean;
   hasAttachment: boolean;
-  executionIds: string[];
   contextPercentage?: number;
+  workspacePath?: string;
+  executionIds: string[];
 }
 
 /**
@@ -235,6 +238,12 @@ function loadIndex(dir: string): ResolvedSession[] {
         typeof obj?.contextUsagePercentage === 'number'
           ? obj.contextUsagePercentage
           : undefined;
+      const wsPath =
+        typeof obj?.workspacePath === 'string'
+          ? obj.workspacePath
+          : typeof obj?.workspaceDirectory === 'string'
+          ? obj.workspaceDirectory
+          : undefined;
       entry = {
         sessionId: path.basename(f, '.json'),
         mtimeMs: stat.mtimeMs,
@@ -244,8 +253,9 @@ function loadIndex(dir: string): ResolvedSession[] {
         firstUserText: parsed.firstUserText,
         hasImage: parsed.hasImage,
         hasAttachment: parsed.hasAttachment,
-        executionIds: parsed.executionIds,
         contextPercentage: ctxPct,
+        workspacePath: wsPath,
+        executionIds: parsed.executionIds,
       };
       indexCache.set(full, entry);
     }
@@ -260,8 +270,9 @@ function loadIndex(dir: string): ResolvedSession[] {
       firstUserText: entry.firstUserText,
       hasImage: entry.hasImage,
       hasAttachment: entry.hasAttachment,
-      executionIds: entry.executionIds,
       contextPercentage: entry.contextPercentage,
+      workspacePath: entry.workspacePath,
+      executionIds: entry.executionIds,
     });
   }
 
@@ -290,7 +301,6 @@ export function searchSessionsInDir(
 
   const entries = loadIndex(dir);
   const out: SearchHit[] = [];
-  const execIdsById = new Map<string, string[]>();
 
   for (const e of entries) {
     let snippet = '';
@@ -308,7 +318,6 @@ export function searchSessionsInDir(
     }
 
     if (matchField) {
-      execIdsById.set(e.sessionId, e.executionIds);
       out.push({
         sessionId: e.sessionId,
         title: e.title || 'Untitled',
@@ -324,7 +333,7 @@ export function searchSessionsInDir(
 
   out.sort((a, b) => b.modified - a.modified);
   const limited = out.slice(0, limit);
-  attachCredits(dir, limited, execIdsById);
+  attachCredits(dir, limited, workspacePathOf(entries), execIdsOf(entries));
   return limited;
 }
 
@@ -346,12 +355,10 @@ export function listRecentSessions(dir: string, limit = 20): SearchHit[] {
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
   const out: SearchHit[] = [];
-  const execIdsById = new Map<string, string[]>();
   for (const e of entries.slice(0, limit)) {
     const snippet = e.firstUserText
       ? e.firstUserText.slice(0, 160).replace(/\s+/g, ' ').trim()
       : '';
-    execIdsById.set(e.sessionId, e.executionIds);
     out.push({
       sessionId: e.sessionId,
       title: e.title || 'Untitled',
@@ -363,18 +370,35 @@ export function listRecentSessions(dir: string, limit = 20): SearchHit[] {
       contextPercentage: e.contextPercentage,
     });
   }
-  attachCredits(dir, out, execIdsById);
+  attachCredits(dir, out, workspacePathOf(entries), execIdsOf(entries));
   return out;
 }
 
+/** 取一组会话里的工作区 fsPath（同一目录下的会话共享同一工作区）。 */
+function workspacePathOf(entries: ResolvedSession[]): string | undefined {
+  for (const e of entries) {
+    if (e.workspacePath) return e.workspacePath;
+  }
+  return undefined;
+}
+
+/** 建立 sessionId → 其 history executionId 列表 的映射（供 lineage 追溯）。 */
+function execIdsOf(entries: ResolvedSession[]): Map<string, string[]> {
+  const m = new Map<string, string[]>();
+  for (const e of entries) m.set(e.sessionId, e.executionIds);
+  return m;
+}
+
 /**
- * 为最终返回的结果集补充 credit 用量（只对有限的结果集做反查，避免全量扫描）。
- * credit 取自 Kiro 执行存档；查不到（已被 LRU 淘汰 / 旧版本）则保持 undefined，
- * 由上层回退展示 contextPercentage。任何异常都被吞掉，不影响搜索结果本身。
+ * 为最终返回的结果集补充 credit 用量（只对有限的结果集做汇总，避免无谓开销）。
+ * credit 按执行存档的 chatSessionId 与会话 sessionId 匹配汇总，并顺 history executionId
+ * 追溯 checkpoint 祖先会话一并合计（见 credits.ts 说明）；查不到带用量的执行则保持
+ * undefined，由上层回退展示 contextPercentage。异常一律吞掉，不影响搜索结果本身。
  */
 function attachCredits(
   dir: string,
   hits: SearchHit[],
+  workspacePath: string | undefined,
   execIdsById: Map<string, string[]>
 ): void {
   if (!hits.length) return;
@@ -385,13 +409,14 @@ function attachCredits(
     return;
   }
   for (const hit of hits) {
-    const ids = execIdsById.get(hit.sessionId);
-    if (!ids || ids.length === 0) continue;
     try {
-      const { credits, found } = getCreditsForExecutions(storeRoot, ids);
+      const { credits, found } = getCreditsForSessions(storeRoot, [hit.sessionId], {
+        workspacePath,
+        historyExecutionIds: execIdsById.get(hit.sessionId),
+      });
       if (found) hit.credits = credits;
     } catch {
-      // 反查失败不影响结果展示
+      // 汇总失败不影响结果展示
     }
   }
 }

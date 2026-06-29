@@ -72,14 +72,14 @@
 
 ### credit 数据从哪来
 
-Kiro **不会**把 credit 写进对话历史 JSON——会话文件里只保留对 `executionId`（每一轮 agent 执行的 ID）的引用。真正的用量存在一份**独立的执行存档**里，由 Kiro 扩展的 `ExecutionLogController` 通过 `WriteBackCache` 落盘：
+Kiro **不会**把 credit 写进对话历史 JSON——会话文件只保留对 `executionId` 的引用。真正的用量存在一份**独立的执行存档**里，由 Kiro 扩展的 `ExecutionLogController` 通过 `WriteBackCache` 落盘：
 
 ```
 <UserData>/User/globalStorage/kiro.kiroagent/<workspaceId>/[<hash("KIRO::EXECUTION::SAVES")>/]<hash(executionId)>
 ```
 
-- 目录名与文件名都是 **`sha256(key)` 十六进制的前 32 位**（见下方算法），与 Kiro storage 的路径哈希实现完全一致。
-- 每个执行存档是一份 JSON，含 `usageSummary` 数组，credit 项形如：
+- 目录名与文件名都是 **`sha256(key)` 十六进制的前 32 位**。其中 **`workspaceId = sha256(工作区 fsPath)`**——据此可直接定位当前工作区的执行存储目录。
+- 每个执行存档是一份 JSON，含 `chatSessionId`（该执行所属会话）与末尾的 `usageSummary` 数组，credit 项形如：
 
   ```json
   { "usage": 0.00972499529021559, "unit": "credit", "unitPlural": "credits" }
@@ -88,36 +88,34 @@ Kiro **不会**把 credit 写进对话历史 JSON——会话文件里只保留�
   数组里还会混入 `{ "usedTools": [...] }` 等非 credit 项，需按 `unit === "credit"` 过滤。
 - 该存档是 **LRU 缓存（上限约 500 条执行）**，较老的执行会被淘汰，因此并非所有历史对话都还查得到 credit——这也是回退到上下文百分比的原因。
 
+### 为什么按 `chatSessionId` 关联（而非 history 的 executionId）
+
+普通对话里 `history[].executionId` 直接指向带 `usageSummary` 的执行，按它反查即可。但 **spec / checkpoint 会话**不同：创建检查点时 Kiro 会 `migrateExecutionToSession` 迁移执行，结果是 checkpoint 会话 `history` 引用的执行变成**没有 usageSummary 的迁移记录**，真正消耗 credit 的执行改以 `chatSessionId` 标记。因此扩展统一**按 `chatSessionId == 会话 sessionId` 汇总**，对普通对话与 spec/checkpoint 都成立。
+
 ### credit 计算算法
 
 扩展按以下步骤汇总单个对话的 credit（实现见 `src/credits.ts`）：
 
-1. **取 executionId**：解析会话 JSON 的 `history` / `messages`，收集每个条目的 `executionId`（去重）。
-2. **定位执行存档**：对每个 `executionId` 计算
-
-   ```
-   fileName = sha256(executionId).toString("hex").slice(0, 32)
-   ```
-
-   在执行存储根目录下深度受限地扫描（跳过 `workspace-sessions` 与体量巨大的代码库索引子树），用 `文件名 → 绝对路径` 索引定位；未命中时强制重建一次索引重试（覆盖新产生的执行）。兼容两种布局：`<wsId>/<hash(eid)>` 与 `<wsId>/<hash(SAVES)>/<hash(eid)>`。
-3. **解析用量**：用**字符串感知的括号配对**只从原文切出 `"usageSummary": [...]` 数组文本（避免整体 `JSON.parse` 多 MB 的 `operations`），再解析该数组。
-4. **求和**：累加数组中所有 `unit === "credit"`（大小写不敏感）项的 `usage`，得到该执行的 credit；把会话引用的全部执行加总，即为该对话的总 credit 消耗。
-5. **缓存**：单个执行存档的解析结果按 `(mtime, size)` 缓存；执行存储目录的文件名索引带 4s 节流，避免每次输入都重扫磁盘。
+1. **限定扫描范围**：由会话顶层的 `workspacePath` 算出 `workspaceId = sha256(路径)[:32]`（覆盖盘符大小写/斜杠变体），只扫描该工作区对应的存储目录，避免遍历其它工作区的大量大文件。
+2. **解析执行存档**：遍历目录下 hex 命名的存档，提取每个的 `chatSessionId` 与 credit。利用"`chatSessionId` 在文件头、`usageSummary` 在文件尾"的规律**只读头部 + 尾部**，头部找不到 `chatSessionId`（或尾部数组被截断）时才整读兜底——避免读入多 MB 的 `operations`。
+3. **切出用量数组**：用**字符串感知的括号配对**锚定真正的 `"usageSummary":[…]` 字段，并取**最后一个**匹配（真字段在 operations 之后、接近文件末尾），避免误取正文里出现的 “usageSummary” 词。
+4. **求和**：累加 `unit === "credit"`（大小写不敏感）项的 `usage`，得到该执行的 credit。
+5. **按会话汇总（含 checkpoint lineage）**：把所有 `chatSessionId` 命中目标会话的执行 credit 相加；并顺会话 `history[].executionId` 反查这些执行所属的 `chatSessionId`，把 checkpoint 的**祖先会话**一并纳入，得到整条对话（含继承轮次）的总消耗。
+6. **缓存**：单个执行存档的解析结果按 `(mtime, size)` 缓存；目录扫描带 4s 节流。
 
 > 该汇总等同于把 Kiro 聊天界面里每一轮的 “Est. Credits Used” 相加。credit 只读不写，整个过程不联网。
+> 因此对一条 4 次检查点的 spec，原始会话显示其自身消耗，越靠后的检查点显示的累计越多（含继承轮次），最后一个检查点显示整条对话的总消耗。
 
 ### 刷新时机与缓存
 
-credit 不单独刷新，而是**挂在每次搜索/列表请求上**：与会话搜索同源触发——输入关键词（120ms 防抖）、清空输入、切换附件过滤（`revalidate`）、面板重新可见或侧边栏切回（`refresh`）时，都会为**当前展示的结果集**（搜索 ≤10 条、最近 ≤20 条）重算 credit，不做全量扫描。
+credit 不单独刷新，而是**挂在每次搜索/列表请求上**：与会话搜索同源触发——输入关键词（120ms 防抖）、清空输入、切换附件过滤（`revalidate`）、面板重新可见或侧边栏切回（`refresh`）、点击刷新按钮时，都会为**当前展示的结果集**（搜索 ≤10 条、最近 ≤20 条）重算 credit，不做全量扫描。
 
 缓存分两层，失效判据不同：
 
-- **执行存档解析结果**：与会话记录一致，按文件的 `(mtime, size)` 判失效。文件变化（对话进行中 `usageSummary` 被追加，mtime/size 均变）→ 重新解析；未变 → 复用缓存值。
-- **`executionId → 文件路径` 目录索引**：带 **4 秒节流**，避免每次输入都重扫整个执行存储；但**未命中即强制重建一次**——某个 `executionId` 的哈希不在当前索引时（如对话刚产生新一轮执行 = 新文件），立即强制重扫再查，因此新执行不会被节流漏掉。
+- **执行存档解析结果**：按文件的 `(mtime, size)` 判失效。文件变化（对话进行中 `usageSummary` 被追加，mtime/size 均变）→ 重新解析；未变 → 复用缓存值。
+- **目录文件名索引**：带 **4 秒节流**，避免每次输入都重扫整个工作区存储目录。
 
-对**进行中的对话**，credit 会在下次搜索时自然增长：会话 JSON 变化 → 会话索引重新解析并拿到新增 `executionId` → 新执行（新文件）经"未命中强制重建"被找到 → 已有执行经 `(mtime, size)` 失效被重新解析。
-
-> 与会话索引缓存一样，这些缓存仅存于扩展**进程内存**，扩展停用即释放；重新打开后首次搜索会重新扫描。4 秒目录节流纯属性能优化，不影响结果正确性（未命中会强制重扫兜底）。
+> 与会话索引缓存一样，这些缓存仅存于扩展**进程内存**，扩展停用即释放；重新打开后首次搜索会重新扫描。
 
 ## 跨平台路径规则
 

@@ -1,11 +1,13 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import {
   hash32,
+  workspaceIdCandidates,
   extractUsageSummaryArray,
   sumCreditsFromUsageSummary,
-  getCreditsForExecutions,
+  getCreditsForSessions,
   storeRootFromSessionDir,
   __clearCreditCacheForTest,
 } from '../src/credits';
@@ -29,36 +31,74 @@ function freshDir(): string {
   return d;
 }
 
-/** 在 storeRoot 下按 Kiro 的哈希布局写一个执行存档文件。 */
-function writeExecution(
+let counter = 0;
+/** 在 storeRoot 下按 workspaceId 目录写一个执行存档（hex32 文件名）。 */
+function writeArchive(
   storeRoot: string,
-  workspaceId: string,
-  executionId: string,
-  obj: unknown,
-  opts: { underSavesFolder?: boolean } = {}
+  workspacePath: string,
+  chatSessionId: string,
+  usageSummary: unknown,
+  opts: {
+    underSavesFolder?: boolean;
+    omitUsageSummary?: boolean;
+    /** 注入到 operations 里的文本（用于模拟正文中出现 "usageSummary" 等） */
+    opsText?: string;
+    /** operations 追加的字节数，制造超过头尾窗口的大文件 */
+    bigBytes?: number;
+    /** 指定该存档对应的 executionId（文件名按 hash32(executionId) 生成，便于 lineage 反查） */
+    executionId?: string;
+  } = {}
 ): string {
-  let dir = path.join(storeRoot, workspaceId);
-  if (opts.underSavesFolder) {
-    dir = path.join(dir, hash32('KIRO::EXECUTION::SAVES'));
-  }
+  const wsId = hash32(workspacePath);
+  let dir = path.join(storeRoot, wsId);
+  if (opts.underSavesFolder) dir = path.join(dir, hash32('KIRO::EXECUTION::SAVES'));
   fs.mkdirSync(dir, { recursive: true });
-  const full = path.join(dir, hash32(executionId));
-  fs.writeFileSync(full, JSON.stringify(obj), 'utf8');
+  const fileName = opts.executionId
+    ? hash32(opts.executionId)
+    : crypto
+        .createHash('sha256')
+        .update('exec-' + counter++)
+        .digest('hex')
+        .slice(0, 32);
+
+  // 关键：键顺序贴合真实 Kiro —— operations 在前、usageSummary 在末尾，
+  // 以验证"正文里出现的 usageSummary 文本不会被误取为真正字段"。
+  let opsMessage = opts.opsText ?? 'x'.repeat(50);
+  if (opts.bigBytes) opsMessage = opsMessage + 'x'.repeat(opts.bigBytes);
+  const parts: string[] = [];
+  parts.push('"executionId":"e' + counter + '"');
+  parts.push('"chatSessionId":' + JSON.stringify(chatSessionId));
+  parts.push('"status":"succeed"');
+  parts.push(
+    '"operations":[{"type":"Say","output":{"message":' + JSON.stringify(opsMessage) + '}}]'
+  );
+  if (!opts.omitUsageSummary) {
+    parts.push('"usageSummary":' + JSON.stringify(usageSummary));
+  }
+  const full = path.join(dir, fileName);
+  fs.writeFileSync(full, '{' + parts.join(',') + '}', 'utf8');
   return full;
 }
 
 describe('hash32', () => {
   it('与 Kiro 实测哈希一致（已知键）', () => {
-    // 这些值在真实 Kiro 安装上逆向核对过。
     expect(hash32('KIRO::EXECUTION::METADATA')).toBe('f62de366d0006e17ea00a01f6624aabf');
     expect(hash32('KIRO::EXECUTION::SAVES')).toBe('414d1636299d2b9e4ce7e17fb11f63e9');
-    expect(hash32('7c56dac9-b51a-4be0-aca5-48aa0c669eae')).toBe(
-      '12ead51a160773e06f3e20f6fbd0e5a2'
-    );
+    // workspaceId = hash(工作区 fsPath)，实测核对过
+    expect(hash32('d:\\Projects\\DotNet\\CsCodeMap')).toBe('16277c8d93232c28e753d255666b7b69');
   });
 
   it('输出恒为 32 位十六进制', () => {
     expect(hash32('anything')).toMatch(/^[0-9a-f]{32}$/);
+  });
+});
+
+describe('workspaceIdCandidates', () => {
+  it('包含原始路径的哈希，并覆盖盘符大小写/斜杠变体', () => {
+    const ids = workspaceIdCandidates('d:\\Projects\\DotNet\\CsCodeMap');
+    expect(ids).toContain('16277c8d93232c28e753d255666b7b69');
+    expect(ids.length).toBeGreaterThan(1);
+    ids.forEach((id) => expect(id).toMatch(/^[0-9a-f]{32}$/));
   });
 });
 
@@ -88,15 +128,31 @@ describe('extractUsageSummaryArray', () => {
   it('无 usageSummary 时返回 null', () => {
     expect(extractUsageSummaryArray('{"foo":1}')).toBeNull();
   });
+
+  it('忽略正文里出现的 usageSummary 词，取末尾真正的字段', () => {
+    // operations 文本里有"假"的 usageSummary 提及，真正字段在最后
+    const raw =
+      '{"operations":[{"output":{"message":"我们在讨论 usageSummary 这个词，甚至 [写了括号]"}}],' +
+      '"usageSummary":[{"usage":0.7,"unit":"credit"}]}';
+    const arr = extractUsageSummaryArray(raw);
+    expect(arr).not.toBeNull();
+    expect(JSON.parse(arr!)[0].usage).toBe(0.7);
+  });
+
+  it('取最后一个 usageSummary 字段（operations 之后的真字段）', () => {
+    const raw =
+      '{"a":"usageSummary mentioned","usageSummary":[{"usage":1,"unit":"credit"}]}';
+    expect(JSON.parse(extractUsageSummaryArray(raw)!)[0].usage).toBe(1);
+  });
 });
 
 describe('sumCreditsFromUsageSummary', () => {
   it('只累加 unit==="credit" 的 usage', () => {
     const text = JSON.stringify([
       { usage: 0.1, unit: 'credit' },
-      { usage: 99, unit: 'tokens' }, // 非 credit，忽略
-      { usedTools: ['x'] }, // 无 usage，忽略
-      { usage: 0.05, unit: 'CREDIT' }, // 大小写不敏感
+      { usage: 99, unit: 'tokens' },
+      { usedTools: ['x'] },
+      { usage: 0.05, unit: 'CREDIT' },
     ]);
     expect(sumCreditsFromUsageSummary(text)).toBeCloseTo(0.15, 10);
   });
@@ -115,86 +171,141 @@ describe('storeRootFromSessionDir', () => {
   });
 });
 
-describe('getCreditsForExecutions', () => {
-  it('跨多个执行汇总 credit（扁平布局 + SAVES 子目录布局都能找到）', () => {
-    const root = freshDir();
-    writeExecution(root, 'ws1', 'eid-A', {
-      executionId: 'eid-A',
-      usageSummary: [{ usage: 0.2, unit: 'credit', unitPlural: 'credits' }],
-    });
-    writeExecution(
-      root,
-      'ws1',
-      'eid-B',
-      {
-        executionId: 'eid-B',
-        usageSummary: [
-          { usage: 0.3, unit: 'credit' },
-          { usedTools: ['execute_pwsh'] },
-        ],
-      },
-      { underSavesFolder: true }
-    );
+describe('getCreditsForSessions', () => {
+  const WS = 'd:\\test\\ws';
 
-    const res = getCreditsForExecutions(root, ['eid-A', 'eid-B']);
+  it('按 chatSessionId 跨多个执行汇总（扁平 + SAVES 子目录布局都计入）', () => {
+    const root = freshDir();
+    writeArchive(root, WS, 'sess-A', [{ usage: 0.2, unit: 'credit' }]);
+    writeArchive(root, WS, 'sess-A', [{ usage: 0.3, unit: 'credit' }, { usedTools: ['x'] }], {
+      underSavesFolder: true,
+    });
+    writeArchive(root, WS, 'sess-OTHER', [{ usage: 9, unit: 'credit' }]); // 不同会话，不计入
+
+    const res = getCreditsForSessions(root, ['sess-A'], { workspacePath: WS });
     expect(res.found).toBe(true);
     expect(res.credits).toBeCloseTo(0.5, 10);
   });
 
-  it('找不到任何执行存档时 found=false、credits=0', () => {
+  it('没有任何匹配会话的执行时 found=false', () => {
     const root = freshDir();
-    const res = getCreditsForExecutions(root, ['missing-eid']);
+    writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }]);
+    const res = getCreditsForSessions(root, ['missing'], { workspacePath: WS });
     expect(res.found).toBe(false);
     expect(res.credits).toBe(0);
   });
 
-  it('部分命中：缺失的 executionId 被跳过，仍返回 found=true', () => {
+  it('匹配会话但执行存档无 usageSummary 时 found=false（区分"没记录"与"0 credit"）', () => {
     const root = freshDir();
-    writeExecution(root, 'ws1', 'eid-A', {
-      usageSummary: [{ usage: 1.5, unit: 'credit' }],
-    });
-    const res = getCreditsForExecutions(root, ['eid-A', 'eid-gone']);
-    expect(res.found).toBe(true);
-    expect(res.credits).toBeCloseTo(1.5, 10);
+    writeArchive(root, WS, 'sess-spec', null, { omitUsageSummary: true });
+    const res = getCreditsForSessions(root, ['sess-spec'], { workspacePath: WS });
+    expect(res.found).toBe(false);
+    expect(res.credits).toBe(0);
   });
 
-  it('空 executionId 列表安全返回', () => {
+  it('含 usageSummary 但无 credit 项时 found=true、credits=0', () => {
     const root = freshDir();
-    expect(getCreditsForExecutions(root, [])).toEqual({ credits: 0, found: false });
+    writeArchive(root, WS, 'sess-zero', [{ usedTools: ['execute_pwsh'] }]);
+    const res = getCreditsForSessions(root, ['sess-zero'], { workspacePath: WS });
+    expect(res.found).toBe(true);
+    expect(res.credits).toBe(0);
+  });
+
+  it('指定 workspacePath 时只扫描该工作区目录（其它工作区的同名会话不计入）', () => {
+    const root = freshDir();
+    writeArchive(root, 'd:\\test\\ws', 'shared-sid', [{ usage: 1, unit: 'credit' }]);
+    writeArchive(root, 'd:\\test\\other', 'shared-sid', [{ usage: 5, unit: 'credit' }]);
+    const res = getCreditsForSessions(root, ['shared-sid'], { workspacePath: 'd:\\test\\ws' });
+    expect(res.credits).toBeCloseTo(1, 10);
+  });
+
+  it('空 sessionId 列表安全返回', () => {
+    const root = freshDir();
+    expect(getCreditsForSessions(root, [], { workspacePath: WS })).toEqual({
+      credits: 0,
+      found: false,
+    });
+  });
+
+  it('checkpoint lineage：顺 history executionId 把祖先会话的消耗一并合计', () => {
+    const root = freshDir();
+    const ANCESTOR = 'sess-ancestor';
+    const CHECKPOINT = 'sess-checkpoint';
+    // 祖先会话自己的带 credit 执行
+    writeArchive(root, WS, ANCESTOR, [{ usage: 700, unit: 'credit' }]);
+    // checkpoint 自己的新增带 credit 执行
+    writeArchive(root, WS, CHECKPOINT, [{ usage: 50, unit: 'credit' }]);
+    // checkpoint 的 history 引用的执行——属于祖先会话、无 usageSummary（迁移记录）
+    writeArchive(root, WS, ANCESTOR, null, {
+      omitUsageSummary: true,
+      executionId: 'hist-ref-1',
+    });
+
+    // 默认 includeLineage：传入 history executionId → 应合计祖先 + 自身 = 750
+    const withLineage = getCreditsForSessions(root, [CHECKPOINT], {
+      workspacePath: WS,
+      historyExecutionIds: ['hist-ref-1'],
+    });
+    expect(withLineage.found).toBe(true);
+    expect(withLineage.credits).toBeCloseTo(750, 6);
+
+    // 关闭 lineage：仅自身 = 50
+    const selfOnly = getCreditsForSessions(root, [CHECKPOINT], {
+      workspacePath: WS,
+      historyExecutionIds: ['hist-ref-1'],
+      includeLineage: false,
+    });
+    expect(selfOnly.credits).toBeCloseTo(50, 6);
+  });
+
+  it('正文里嵌入伪 usageSummary 不污染结果（取末尾真字段）', () => {
+    const root = freshDir();
+    writeArchive(root, WS, 'sess-fp', [{ usage: 0.5, unit: 'credit' }], {
+      opsText: '伪造 "usageSummary":[{"usage":999,"unit":"credit"}] 出现在正文里',
+    });
+    const res = getCreditsForSessions(root, ['sess-fp'], { workspacePath: WS });
+    expect(res.found).toBe(true);
+    expect(res.credits).toBeCloseTo(0.5, 10); // 不是 999
+  });
+
+  it('大文件（超过头尾窗口）：chatSessionId 在头、usageSummary 在尾仍能正确汇总', () => {
+    const root = freshDir();
+    // operations 追加 ~700KB，文件超过 HEAD(512K)+TAIL(128K)=640K
+    writeArchive(root, WS, 'sess-big', [{ usage: 3.14, unit: 'credit' }], {
+      bigBytes: 700 * 1024,
+    });
+    const res = getCreditsForSessions(root, ['sess-big'], { workspacePath: WS });
+    expect(res.found).toBe(true);
+    expect(res.credits).toBeCloseTo(3.14, 10);
   });
 });
 
 describe('search 集成：credits / contextPercentage 流入结果', () => {
-  /** 搭建 <root>/workspace-sessions/<key>/ 会话目录与同级执行存档。 */
+  const WS = 'd:\\test\\proj';
+
   function buildLayout() {
-    const root = freshDir(); // 充当 kiro.kiroagent 根
+    const root = freshDir(); // kiro.kiroagent 根
     const sessionDir = path.join(root, 'workspace-sessions', 'ENCODEDKEY');
     fs.mkdirSync(sessionDir, { recursive: true });
     return { root, sessionDir };
   }
 
-  it('listRecentSessions 汇总会话的 credit 并附带上下文百分比', () => {
+  it('listRecentSessions 按 chatSessionId 汇总 credit 并带上下文百分比', () => {
     const { root, sessionDir } = buildLayout();
-    // 会话引用两个 executionId，且带 contextUsagePercentage
     fs.writeFileSync(
       path.join(sessionDir, 's1.json'),
       JSON.stringify({
         title: 'Session One',
+        sessionId: 's1',
+        workspacePath: WS,
         contextUsagePercentage: 42.5,
-        history: [
-          { message: { role: 'user', content: 'hello' } },
-          { message: { role: 'assistant', content: 'hi' }, executionId: 'eid-A' },
-          { message: { role: 'assistant', content: 'more' }, executionId: 'eid-B' },
-        ],
+        history: [{ message: { role: 'user', content: 'hello' } }],
       }),
       'utf8'
     );
-    writeExecution(root, 'ws1', 'eid-A', {
-      usageSummary: [{ usage: 0.4, unit: 'credit' }],
-    });
-    writeExecution(root, 'ws1', 'eid-B', {
-      usageSummary: [{ usage: 0.6, unit: 'credit' }],
-    });
+    // 真正带 credit 的执行以 chatSessionId 关联（executionId 不在会话 history 里也能找到）
+    writeArchive(root, WS, 's1', [{ usage: 0.4, unit: 'credit' }]);
+    writeArchive(root, WS, 's1', [{ usage: 0.6, unit: 'credit' }]);
 
     const hits = listRecentSessions(sessionDir, 20);
     expect(hits).toHaveLength(1);
@@ -202,20 +313,56 @@ describe('search 集成：credits / contextPercentage 流入结果', () => {
     expect(hits[0].contextPercentage).toBeCloseTo(42.5, 10);
   });
 
-  it('查不到执行存档时 credits 保持 undefined，但仍带 contextPercentage 回退', () => {
+  it('无带用量的执行时 credits 保持 undefined，仍带 contextPercentage 回退', () => {
     const { sessionDir } = buildLayout();
     fs.writeFileSync(
       path.join(sessionDir, 's2.json'),
       JSON.stringify({
-        title: 'No Exec Data',
+        title: 'No Credit Data',
+        sessionId: 's2',
+        workspacePath: WS,
         contextUsagePercentage: 12.3,
-        history: [{ message: { role: 'assistant', content: 'x' }, executionId: 'gone' }],
+        history: [{ message: { role: 'assistant', content: 'x' } }],
       }),
       'utf8'
     );
-    const hits = searchSessionsInDir(sessionDir, 'No Exec', 10);
+    const hits = searchSessionsInDir(sessionDir, 'No Credit', 10);
     expect(hits).toHaveLength(1);
     expect(hits[0].credits).toBeUndefined();
     expect(hits[0].contextPercentage).toBeCloseTo(12.3, 10);
+  });
+
+  it('回归：spec/checkpoint —— history 引用的执行无用量，credit 落在同 chatSessionId 的其它执行上', () => {
+    // 复现真实 bug：会话 history 里的 executionId 指向"无 usageSummary 的迁移记录"，
+    // 真正消耗 credit 的执行用的是另一批 id、仅靠 chatSessionId 关联。
+    const { root, sessionDir } = buildLayout();
+    const sid = 'spec-4x-checkpoint';
+    fs.writeFileSync(
+      path.join(sessionDir, sid + '.json'),
+      JSON.stringify({
+        title: 'Spec: field-reference-indexing (checkpoint)',
+        sessionId: sid,
+        workspacePath: WS,
+        contextUsagePercentage: 73,
+        history: [
+          // history 引用的执行——无 usageSummary（模拟 checkpoint 迁移记录）
+          { message: { role: 'assistant', content: 'step' }, executionId: 'hist-exec-1' },
+          { message: { role: 'assistant', content: 'step' }, executionId: 'hist-exec-2' },
+        ],
+      }),
+      'utf8'
+    );
+    // history 引用的执行存档：有该 chatSessionId 但**无 usageSummary**
+    writeArchive(root, WS, sid, null, { omitUsageSummary: true });
+    writeArchive(root, WS, sid, null, { omitUsageSummary: true });
+    // 真正带 credit 的执行：同 chatSessionId、不同（未被 history 引用的）id
+    writeArchive(root, WS, sid, [{ usage: 109.5, unit: 'credit' }]);
+    writeArchive(root, WS, sid, [{ usage: 60.4, unit: 'credit' }, { usedTools: ['x'] }]);
+
+    const hits = listRecentSessions(sessionDir, 20);
+    const hit = hits.find((h) => h.sessionId === sid)!;
+    expect(hit).toBeDefined();
+    // 必须按 chatSessionId 汇总到 169.9，而不是因 history executionId 无用量而显示 0/undefined
+    expect(hit.credits).toBeCloseTo(169.9, 6);
   });
 });
