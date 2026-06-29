@@ -70,6 +70,15 @@
 - **`◷ 24%`**：当真实 credit 不可用时的**回退**，展示会话的上下文窗口占用百分比（Kiro 本地估算，写在会话 JSON 顶层的 `contextUsagePercentage`）。
 - 两者都拿不到时不显示角标。
 
+### 两种 credit 口径（`Σ` 开关）
+
+过滤标签行右侧的 **`Σ` 切换**控制 credit 角标的统计口径，状态会被记住：
+
+- **`Σ 自身`（默认，方案 C）**：只统计该会话**自身**消耗（`chatSessionId == 本会话` 的执行）。每个 checkpoint 快照显示各自实际新增的 credit，互不重复，便于直观看清每段对话真正花了多少。
+- **`Σ 累计`（方案 A）**：显示**整段对话的累计**消耗（含 checkpoint 祖先链）。打开任一 checkpoint 都能看到整条对话到该快照为止的总成本；hover 提示里同时给出"本快照新增"。
+
+> 因为一条 spec 常被 checkpoint 切成多条会话记录：自身口径下它们各显增量（某些"只存档没干活"的快照可能为 0 → 回退显示上下文%）；累计口径下越靠后的快照数值越大，最后一个等于整条对话总消耗。
+
 ### credit 数据从哪来
 
 Kiro **不会**把 credit 写进对话历史 JSON——会话文件只保留对 `executionId` 的引用。真正的用量存在一份**独立的执行存档**里，由 Kiro 扩展的 `ExecutionLogController` 通过 `WriteBackCache` 落盘：
@@ -100,11 +109,10 @@ Kiro **不会**把 credit 写进对话历史 JSON——会话文件只保留对 
 2. **解析执行存档**：遍历目录下 hex 命名的存档，提取每个的 `chatSessionId` 与 credit。利用"`chatSessionId` 在文件头、`usageSummary` 在文件尾"的规律**只读头部 + 尾部**，头部找不到 `chatSessionId`（或尾部数组被截断）时才整读兜底——避免读入多 MB 的 `operations`。
 3. **切出用量数组**：用**字符串感知的括号配对**锚定真正的 `"usageSummary":[…]` 字段，并取**最后一个**匹配（真字段在 operations 之后、接近文件末尾），避免误取正文里出现的 “usageSummary” 词。
 4. **求和**：累加 `unit === "credit"`（大小写不敏感）项的 `usage`，得到该执行的 credit。
-5. **按会话汇总（含 checkpoint lineage）**：把所有 `chatSessionId` 命中目标会话的执行 credit 相加；并顺会话 `history[].executionId` 反查这些执行所属的 `chatSessionId`，把 checkpoint 的**祖先会话**一并纳入，得到整条对话（含继承轮次）的总消耗。
+5. **按会话汇总（两种口径）**：把所有 `chatSessionId` 命中目标会话的执行 credit 相加得到**自身消耗**；并顺会话 `history[].executionId` 反查这些执行所属的 `chatSessionId`，把 checkpoint 的**祖先会话**一并纳入得到**整段累计**。两个值都随结果下发，由 UI 的 `Σ` 开关选择展示（默认自身）。
 6. **缓存**：单个执行存档的解析结果按 `(mtime, size)` 缓存；目录扫描带 4s 节流。
 
 > 该汇总等同于把 Kiro 聊天界面里每一轮的 “Est. Credits Used” 相加。credit 只读不写，整个过程不联网。
-> 因此对一条 4 次检查点的 spec，原始会话显示其自身消耗，越靠后的检查点显示的累计越多（含继承轮次），最后一个检查点显示整条对话的总消耗。
 
 ### 刷新时机与缓存
 

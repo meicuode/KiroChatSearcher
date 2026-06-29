@@ -149,8 +149,11 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     border-color: var(--vscode-button-background);
     opacity: 1;
   }
-  .refresh-btn {
+  .credit-toggle {
     margin-left: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  .refresh-btn {
     flex-shrink: 0;
     display: inline-flex;
     align-items: center;
@@ -304,6 +307,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     <span class="filter-chip active" data-mode="all">全部</span>
     <span class="filter-chip" data-mode="image">🖼 含图片</span>
     <span class="filter-chip" data-mode="attachment">📎 含附件</span>
+    <span id="creditMode" class="filter-chip credit-toggle" title="开启后 credit 角标显示整段对话累计（含 checkpoint 继承）；关闭则显示该对话自身消耗">Σ 累计</span>
     <span id="refresh" class="refresh-btn" title="刷新（重新统计最新结果与积分消耗）" role="button" aria-label="刷新">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
@@ -320,13 +324,21 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   const $filters = document.querySelectorAll('.filter-chip');
   const $clear = document.getElementById('clear');
   const $refresh = document.getElementById('refresh');
+  const $creditMode = document.getElementById('creditMode');
   const $searchBox = document.querySelector('.search-box');
   let activeIndex = -1;
   let rawResults = [];        // Host 推送的原始结果（未过滤）
   let currentResults = [];    // 当前展示的结果（已应用 AttachmentFilter）
   let currentKeyword = '';
   let filterMode = 'all';
+  let creditMode = 'self'; // 'self'（默认，方案 C）| 'lineage'（方案 A）
   let debounceTimer;
+
+  // 恢复上次的 credit 展示口径
+  try {
+    const st = vscode.getState && vscode.getState();
+    if (st && (st.creditMode === 'self' || st.creditMode === 'lineage')) creditMode = st.creditMode;
+  } catch (e) {}
 
   ${injectedFormatScript()}
 
@@ -382,7 +394,12 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
       const badges =
         (r.hasImage ? '<span class="badge" title="含图片">🖼 </span>' : '') +
         (r.hasAttachment ? '<span class="badge" title="含附件">📎 </span>' : '');
-      const usage = usageLabel(r.credits, r.contextPercentage);
+      const usage = usageLabel({
+        mode: creditMode,
+        selfCredits: r.credits,
+        lineageCredits: r.creditsLineage,
+        contextPercentage: r.contextPercentage,
+      });
       let usageBadge = '';
       if (usage) {
         const icon = usage.kind === 'credit'
@@ -464,6 +481,20 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     $refresh.classList.add('spinning');
     vscode.postMessage({ type: 'hardRefresh' });
   });
+
+  // credit 展示口径切换：self（自身消耗）<-> lineage（整段累计）。
+  // 纯前端重渲染——两个数值都已随结果下发，无需重新取数。
+  function syncCreditModeChip() {
+    $creditMode.classList.toggle('active', creditMode === 'lineage');
+    $creditMode.textContent = creditMode === 'lineage' ? 'Σ 累计' : 'Σ 自身';
+  }
+  $creditMode.addEventListener('click', () => {
+    creditMode = creditMode === 'lineage' ? 'self' : 'lineage';
+    try { vscode.setState && vscode.setState({ creditMode }); } catch (e) {}
+    syncCreditModeChip();
+    renderList(currentResults, currentKeyword);
+  });
+  syncCreditModeChip();
 
   $q.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') {

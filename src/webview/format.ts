@@ -48,30 +48,45 @@ export function fmtTime(ms: number, now: Date = new Date()): string {
 }
 
 /**
- * 用量标签：优先展示真实 credit 消耗（来自 Kiro 执行记录的 usageSummary 汇总），
- * credit 不可用时回退到上下文占用百分比（Kiro 本地估算）。两者都没有时返回 null。
+ * 用量标签：根据展示口径(mode)给出角标文本与提示。
+ * - mode='self'（默认，方案 C）：显示会话自身消耗；存在更大的整段累计时在提示里补充。
+ * - mode='lineage'（方案 A）：显示整段对话累计（含 checkpoint 继承）；提示里补充本快照自身新增。
+ * 主口径无 credit 时回退到上下文占用百分比；都没有则返回 null。
  * 返回 { kind, value, title }：图标由渲染层按 kind 选择 SVG，避免 emoji 字形
  * 在不同平台下垂直对齐不稳定的问题。value/title 由调用方负责 HTML 转义。
  */
-export function usageLabel(
-  credits?: number,
-  contextPercentage?: number
-): { kind: 'credit' | 'context'; value: string; title: string } | null {
-  if (typeof credits === 'number' && isFinite(credits)) {
-    const v = credits >= 10 ? credits.toFixed(1) : credits.toFixed(2);
-    return {
-      kind: 'credit',
-      value: v,
-      title: '该对话实际消耗 ' + credits.toFixed(4) + ' credits（来自 Kiro 执行记录）',
-    };
+export function usageLabel(opts: {
+  mode?: 'self' | 'lineage';
+  selfCredits?: number;
+  lineageCredits?: number;
+  contextPercentage?: number;
+}): { kind: 'credit' | 'context'; value: string; title: string } | null {
+  const mode = opts.mode === 'lineage' ? 'lineage' : 'self';
+  const fmt = (n: number) => (n >= 10 ? n.toFixed(1) : n.toFixed(2));
+  const has = (n: unknown): n is number => typeof n === 'number' && isFinite(n);
+
+  const primary = mode === 'lineage' ? opts.lineageCredits : opts.selfCredits;
+  if (has(primary)) {
+    let title: string;
+    if (mode === 'lineage') {
+      title = '整段对话累计 ' + primary.toFixed(4) + ' credits（含 checkpoint 继承）';
+      if (has(opts.selfCredits)) title += '；本快照新增 ' + opts.selfCredits.toFixed(4);
+    } else {
+      title = '本对话消耗 ' + primary.toFixed(4) + ' credits';
+      if (has(opts.lineageCredits) && opts.lineageCredits > primary + 1e-9) {
+        title += '；含 checkpoint 继承共 ' + opts.lineageCredits.toFixed(4);
+      }
+    }
+    return { kind: 'credit', value: fmt(primary), title };
   }
-  if (typeof contextPercentage === 'number' && isFinite(contextPercentage)) {
+
+  if (has(opts.contextPercentage)) {
     return {
       kind: 'context',
-      value: Math.round(contextPercentage) + '%',
+      value: Math.round(opts.contextPercentage) + '%',
       title:
         '上下文窗口占用 ' +
-        contextPercentage.toFixed(1) +
+        opts.contextPercentage.toFixed(1) +
         '%（credit 数据不可用时的回退，Kiro 本地估算）',
     };
   }

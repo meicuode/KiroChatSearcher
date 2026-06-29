@@ -48,32 +48,52 @@ describe('highlight - 基础', () => {
 });
 
 describe('usageLabel', () => {
-  it('有 credits 时优先展示 credit（<10 保留两位）', () => {
-    const r = usageLabel(0.1234, 80);
+  it('默认(self)显示自身消耗（<10 两位）', () => {
+    const r = usageLabel({ selfCredits: 0.1234, lineageCredits: 5, contextPercentage: 80 });
     expect(r).not.toBeNull();
     expect(r!.kind).toBe('credit');
     expect(r!.value).toBe('0.12');
     expect(r!.title).toContain('0.1234');
   });
 
-  it('credits >= 10 保留一位', () => {
-    expect(usageLabel(14.39)!.value).toBe('14.4');
+  it('self >= 10 保留一位', () => {
+    expect(usageLabel({ selfCredits: 14.39 })!.value).toBe('14.4');
   });
 
-  it('credits=0 仍展示（区别于无数据）', () => {
-    const r = usageLabel(0)!;
+  it('self=0 仍展示（区别于无数据）', () => {
+    const r = usageLabel({ selfCredits: 0 })!;
     expect(r.kind).toBe('credit');
     expect(r.value).toBe('0.00');
   });
 
-  it('无 credits 时回退上下文百分比（四舍五入）', () => {
-    const r = usageLabel(undefined, 42.5);
+  it('self 模式下若有更大的整段累计，提示里补充', () => {
+    const r = usageLabel({ mode: 'self', selfCredits: 11, lineageCredits: 801 })!;
+    expect(r.value).toBe('11.0');
+    expect(r.title).toContain('801');
+  });
+
+  it('lineage 模式显示整段累计，并在提示里补充本快照新增', () => {
+    const r = usageLabel({ mode: 'lineage', selfCredits: 0, lineageCredits: 801.4 })!;
+    expect(r.value).toBe('801.4');
+    expect(r.title).toContain('整段对话累计');
+    expect(r.title).toContain('本快照新增');
+  });
+
+  it('主口径无 credit 时回退上下文百分比（四舍五入）', () => {
+    const r = usageLabel({ contextPercentage: 42.5 });
     expect(r!.kind).toBe('context');
     expect(r!.value).toBe('43%');
     expect(r!.title).toContain('42.5');
   });
 
-  it('两者都无返回 null', () => {
-    expect(usageLabel(undefined, undefined)).toBeNull();
+  it('lineage 模式但只有 self 时回退（lineage 缺失）', () => {
+    const r = usageLabel({ mode: 'lineage', selfCredits: 5, contextPercentage: 30 });
+    // 主口径(lineage)缺失 → 回退上下文
+    expect(r!.kind).toBe('context');
+    expect(r!.value).toBe('30%');
+  });
+
+  it('都无返回 null', () => {
+    expect(usageLabel({})).toBeNull();
   });
 });

@@ -2,7 +2,7 @@
   "name": "kiro-chat-search",
   "displayName": "Kiro Chat Search",
   "description": "搜索 Kiro 当前项目的对话历史，点击可直接跳转到对应会话",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "publisher": "local",
   "license": "MIT",
   "repository": {

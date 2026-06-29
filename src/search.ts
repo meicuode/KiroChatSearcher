@@ -14,10 +14,15 @@ export interface SearchHit {
   /** 会话是否含非空 contextItems 附件 */
   hasAttachment: boolean;
   /**
-   * 该会话的真实 credit 消耗（来自 Kiro 执行存档的 usageSummary 汇总）。
-   * 查不到执行存档（已被 LRU 淘汰 / 旧版本）时为 undefined。
+   * 该会话**自身**的真实 credit 消耗（只统计 chatSessionId==本会话的执行，不含 checkpoint 继承）。
+   * 查不到带用量的执行时为 undefined。默认展示口径（方案 C）。
    */
   credits?: number;
+  /**
+   * 整段对话的累计 credit（含 checkpoint 祖先链）。可选展示口径（方案 A）。
+   * 查不到时为 undefined。
+   */
+  creditsLineage?: number;
   /**
    * 会话上下文窗口占用百分比（Kiro 本地估算，写在会话 JSON 顶层）。
    * 作为 credit 不可用时的回退展示。
@@ -410,11 +415,19 @@ function attachCredits(
   }
   for (const hit of hits) {
     try {
-      const { credits, found } = getCreditsForSessions(storeRoot, [hit.sessionId], {
+      const ids = execIdsById.get(hit.sessionId);
+      // C：会话自身消耗（不含 checkpoint 继承）
+      const self = getCreditsForSessions(storeRoot, [hit.sessionId], {
         workspacePath,
-        historyExecutionIds: execIdsById.get(hit.sessionId),
+        includeLineage: false,
       });
-      if (found) hit.credits = credits;
+      if (self.found) hit.credits = self.credits;
+      // A：整段对话累计（含 checkpoint 祖先链）
+      const lineage = getCreditsForSessions(storeRoot, [hit.sessionId], {
+        workspacePath,
+        historyExecutionIds: ids,
+      });
+      if (lineage.found) hit.creditsLineage = lineage.credits;
     } catch {
       // 汇总失败不影响结果展示
     }
