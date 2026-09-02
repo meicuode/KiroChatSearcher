@@ -2,7 +2,7 @@
   "name": "kiro-chat-search",
   "displayName": "Kiro Chat Search",
   "description": "搜索 Kiro 当前项目的对话历史，点击可直接跳转到对应会话",
-  "version": "0.4.3",
+  "version": "1.0.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -43,6 +43,14 @@
       {
         "command": "kiroChatSearch.toggleView",
         "title": "Kiro: 折叠/展开对话搜索"
+      },
+      {
+        "command": "kiroChatSearch.storageReport",
+        "title": "Kiro: 存储占用分析"
+      },
+      {
+        "command": "kiroChatSearch.storageRanking",
+        "title": "Kiro: 存储占用排行"
       }
     ],
     "menus": {

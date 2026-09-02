@@ -80,6 +80,11 @@ describe('checkEnvironment - 错误优先级', () => {
         homedir: () => '/home/u',
         existsSync: (p: string) => existing.has(p),
         statSync: () => ({ isDirectory: () => true }),
+        // 表达「旧会话目录里确实有一条会话」。Req 1.3 的判据不再只看目录是否存在，
+        // 而是要求「目录存在**且含至少一个 `<sessionId>.json`**」，因此 detectLayout 会
+        // 枚举该目录。不注入 readdirSync 就会落到真实 fs 上、对这个虚构路径抛 ENOENT，
+        // 被当成「旧侧不成立」→ layout 变 none → ok 为 false。
+        readdirSync: () => ['0f0f.json'],
       },
     });
 

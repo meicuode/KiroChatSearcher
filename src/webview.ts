@@ -1,10 +1,20 @@
 import * as vscode from 'vscode';
 import { escapeHtml, escapeRegExp, highlight, fmtTime, usageLabel } from './webview/format';
 import { applyAttachmentFilter } from './webview/filter';
+import {
+  formatSize,
+  originBadgeLabel,
+  parseSize,
+  sizeBadgeLabel,
+  summaryLabel,
+} from './webview/size';
 
 /**
  * 把共享的纯函数序列化为内联脚本源码，保证 webview 运行时与单元测试
  * 使用完全相同的实现。
+ *
+ * 注意注入顺序：`sizeBadgeLabel` / `summaryLabel` 内部调用 `formatSize`，
+ * 因此 `formatSize` / `parseSize` 必须先于两个 label 函数注入到同一作用域。
  */
 function injectedFormatScript(): string {
   return [
@@ -14,6 +24,11 @@ function injectedFormatScript(): string {
     fmtTime.toString(),
     usageLabel.toString(),
     applyAttachmentFilter.toString(),
+    formatSize.toString(),
+    parseSize.toString(),
+    sizeBadgeLabel.toString(),
+    originBadgeLabel.toString(),
+    summaryLabel.toString(),
   ].join('\n');
 }
 
@@ -150,7 +165,21 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     opacity: 1;
   }
   .credit-toggle {
-    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  .filter-chip.busy {
+    pointer-events: none;
+    opacity: .45;
+  }
+  .summary-bar {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    opacity: .7;
+    cursor: default;
     font-variant-numeric: tabular-nums;
   }
   .refresh-btn {
@@ -257,6 +286,43 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     line-height: 1;
     display: block;
   }
+  .badge.size {
+    font-variant-numeric: tabular-nums;
+    background: var(--vscode-badge-background, rgba(127,127,127,.18));
+    color: var(--vscode-badge-foreground, inherit);
+    border-radius: 6px;
+    padding: 0 6px;
+    height: 17px;
+    margin-right: 6px;
+    opacity: .9;
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
+  }
+  .badge.origin {
+    font-size: 10px;
+    font-weight: 500;
+    border-radius: 6px;
+    padding: 0 5px;
+    height: 16px;
+    line-height: 16px;
+    display: inline-block;
+    cursor: help;
+    border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.3));
+    background: transparent;
+  }
+  /* 未迁移：1.x 界面里看不见、删了不可恢复，用警示色标出来 */
+  .badge.origin.warn {
+    color: var(--vscode-editorWarning-foreground, var(--vscode-errorForeground));
+    border-color: var(--vscode-editorWarning-foreground, var(--vscode-errorForeground));
+  }
+  .badge.size.warn {
+    background: var(--vscode-inputValidation-warningBackground, rgba(255,180,0,.22));
+    color: var(--vscode-inputValidation-warningForeground, inherit);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(255,180,0,.6));
+    padding: 0 5px;
+    opacity: 1;
+  }
   .snippet {
     font-size: 12px;
     opacity: .8;
@@ -307,6 +373,8 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     <span class="filter-chip active" data-mode="all">全部</span>
     <span class="filter-chip" data-mode="image">🖼 含图片</span>
     <span class="filter-chip" data-mode="attachment">📎 含附件</span>
+    <span id="summary" class="summary-bar"></span>
+    <span id="computeSize" class="filter-chip" role="button" title="左键统计当前项目占用 · 右键打开占用排行">⛁ 占用</span>
     <span id="creditMode" class="filter-chip credit-toggle" title="开启后 credit 角标显示整段对话累计（含 checkpoint 继承）；关闭则显示该对话自身消耗">Σ 累计</span>
     <span id="refresh" class="refresh-btn" title="刷新（重新统计最新结果与积分消耗）" role="button" aria-label="刷新">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -321,10 +389,16 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   const $q = document.getElementById('q');
   const $status = document.getElementById('status');
   const $results = document.getElementById('results');
-  const $filters = document.querySelectorAll('.filter-chip');
+  // 只选真正的附件过滤 chip：三个过滤 chip 带 data-mode（all/image/attachment），
+  // 而 #computeSize / #creditMode 虽同样带 .filter-chip 类却没有 data-mode。
+  // 若不加 [data-mode] 收窄，过滤点击循环会误把这两个按钮当过滤 chip：点击
+  // ⛁ 占用 或 Σ 累计 时会把附件过滤重置回 'all' 并抢走 .active。
+  const $filters = document.querySelectorAll('.filter-chip[data-mode]');
   const $clear = document.getElementById('clear');
   const $refresh = document.getElementById('refresh');
   const $creditMode = document.getElementById('creditMode');
+  const $computeSize = document.getElementById('computeSize');
+  const $summary = document.getElementById('summary');
   const $searchBox = document.querySelector('.search-box');
   let activeIndex = -1;
   let rawResults = [];        // Host 推送的原始结果（未过滤）
@@ -394,6 +468,13 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
       const badges =
         (r.hasImage ? '<span class="badge" title="含图片">🖼 </span>' : '') +
         (r.hasAttachment ? '<span class="badge" title="含附件">📎 </span>' : '');
+      // 来源角标（Req 9.7）：三种 SessionOrigin 各有短标签；取值不可识别时省略该角标，
+      // 与 credit 不可用时的处理一致 —— 不显示含义不明的标记
+      const origin = originBadgeLabel(r.origin);
+      const originBadge = origin
+        ? '<span class="badge origin' + (origin.warn ? ' warn' : '') + '" title="' +
+          escapeHtml(origin.title) + '">' + escapeHtml(origin.value) + '</span>'
+        : '';
       const usage = usageLabel({
         mode: creditMode,
         selfCredits: r.credits,
@@ -410,10 +491,28 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
             icon + '<span class="usage-val">' + escapeHtml(usage.value) + '</span>' +
           '</span>';
       }
+      // SizeBadge：口径与 credit 的 Σ 开关共用（creditMode）；两个口径的字节数都随
+      // 结果一次下发，切换 Σ 只重渲染、不重新取数。sizeBadgeLabel 返回 null 时省略该角标，
+      // 不影响其余结果（Requirement 5.1–5.6, 9.6）。
+      const size = sizeBadgeLabel({
+        scope: creditMode,
+        layout: r.layout,
+        jsonBytes: r.sessionJsonBytes,
+        archiveBytesSelf: r.archiveBytesSelf,
+        archiveBytesLineage: r.archiveBytesLineage,
+        archivesFound: r.archivesFound,
+      });
+      let sizeBadge = '';
+      if (size) {
+        sizeBadge =
+          '<span class="badge size' + (size.warn ? ' warn' : '') + '" title="' +
+            escapeHtml(size.title) + '">' + escapeHtml(size.value) +
+          '</span>';
+      }
       li.innerHTML =
         '<div class="row1">' +
           '<div class="title">' + highlight(r.title || 'Untitled', keyword) + '</div>' +
-          '<div class="time">' + usageBadge + badges + fmtTime(r.modified) + '</div>' +
+          '<div class="time">' + originBadge + sizeBadge + usageBadge + badges + fmtTime(r.modified) + '</div>' +
         '</div>' +
         '<div class="snippet">' + highlight(r.snippet || '', keyword) + '</div>';
       li.addEventListener('click', () => { activeIndex = i; updateActive(); open(i); });
@@ -496,6 +595,32 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   });
   syncCreditModeChip();
 
+  // SummaryBar 四态渲染：文本与 tooltip 全部由 summaryLabel() 产出。
+  // loading 时给 ComputeSizeButton 加 .busy（pointer-events: none），
+  // 收到 ok/unavailable 时移除，重复左键因此在忙碌期间被忽略。
+  function setSummary(state, data) {
+    const opts = Object.assign({ state: state }, data || {});
+    const out = summaryLabel(opts);
+    if (out) {
+      $summary.textContent = out.text;
+      $summary.title = out.title;
+    }
+    $computeSize.classList.toggle('busy', state === 'loading');
+  }
+
+  // ComputeSizeButton：左键统计当前项目占用，右键打开占用排行。
+  // 忙碌态下 .busy 的 pointer-events: none 会挡住左键，无需额外判重。
+  $computeSize.addEventListener('click', () => {
+    vscode.postMessage({ type: 'computeSize' });
+  });
+  $computeSize.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    vscode.postMessage({ type: 'openRanking' });
+  });
+
+  // 初始停在 idle：只展示提示文案，不触发任何枚举（Requirement 4.2）。
+  setSummary('idle');
+
   $q.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
@@ -541,6 +666,9 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
     } else if (m.type === 'focus') {
       $q.focus();
       $q.select();
+    } else if (m.type === 'summary') {
+      // 四态：idle / loading / ok / unavailable。宿主可随消息附带 summary 数据（ok 态）。
+      setSummary(m.state, m.summary);
     }
   });
 

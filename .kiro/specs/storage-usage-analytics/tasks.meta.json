@@ -1,0 +1,319 @@
+{
+  "pbtResults": {
+    "12.8 编写属性测试：部分成功语义与三类计数守恒": {
+      "status": "passed",
+      "lastRunTimestamp": 1788177835491
+    }
+  },
+  "executionHistory": {
+    "15.1 渲染 ComputeSizeButton 与四态 SummaryBar": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171546354
+      }
+    ],
+    "9.5 编写属性测试：归因守恒": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171560811
+      }
+    ],
+    "9.6 编写属性测试：当前工作区归属等于两处目录之和": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171569714
+      }
+    ],
+    "10.3 编写属性测试：EncodedKey 解码往返与失败回退": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171576279
+      }
+    ],
+    "10.4 编写示例测试 `tests/storage.report.spec.ts`": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171582900
+      }
+    ],
+    "11.6 实现 `getRankingHtml` 渲染": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171594830
+      }
+    ],
+    "11. 排行页取数与纯函数（`src/storage/ranking.ts`）": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171595270
+      }
+    ],
+    "11.7 编写属性测试：排行页取数与行渲染": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171603606
+      }
+    ],
+    "12.4 编写属性测试：路径边界校验的拒绝集合": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171611221
+      }
+    ],
+    "12.5 实现 `removeManifestEntry` 清单读改写": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171617562
+      }
+    ],
+    "12.6 实现 `run()` 的 12 段流水线与 `CleanerFsDeps` 注入": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171624981
+      }
+    ],
+    "12. SessionCleaner（`src/storage/cleaner.ts`，本特性唯一可写模块）": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171625272
+      }
+    ],
+    "15.2 渲染 SizeBadge 并与 `Σ` 开关联动": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171665793
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235586425
+      }
+    ],
+    "16.4 实现 `RankingPanel` 单例与五态状态机": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171672345
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235676674
+      }
+    ],
+    "9.7 编写属性测试：非会话数据被排除在会话占用之外": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171678846
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235099114
+      }
+    ],
+    "12.2 编写属性测试：CleanupPlan 的集合定义与封闭性": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171686336
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235102847
+      }
+    ],
+    "16.2 在 `SearchSession` 接入新的手动触发协议": [
+      {
+        "executionId": "777c5d98-57ba-4364-b033-2b4f2851e16e",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788171694237
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235590697
+      }
+    ],
+    "16.3 实现 StorageReportCommand": [
+      {
+        "executionId": "ec813d4b-1b2e-4ca5-8a7a-828bdea0a8b5",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788176888530
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235589531
+      }
+    ],
+    "9.8 编写属性测试：统计幂等且缓存透明": [
+      {
+        "executionId": "ec813d4b-1b2e-4ca5-8a7a-828bdea0a8b5",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788176896084
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235105577
+      }
+    ],
+    "12.7 编写属性测试：TOCTOU 复核的三分支跳过语义": [
+      {
+        "executionId": "ec813d4b-1b2e-4ca5-8a7a-828bdea0a8b5",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788176897913
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235226346
+      }
+    ],
+    "9.10 编写示例测试 `tests/storage.analyzer.spec.ts`": [
+      {
+        "executionId": "ec813d4b-1b2e-4ca5-8a7a-828bdea0a8b5",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788176898485
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235113089
+      }
+    ],
+    "12.11 编写示例测试 `tests/storage.cleaner.spec.ts`": [
+      {
+        "executionId": "ec813d4b-1b2e-4ca5-8a7a-828bdea0a8b5",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788176899582
+      },
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235233524
+      }
+    ],
+    "9.9 编写属性测试：统计路径只读与调用面约束": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235108119
+      }
+    ],
+    "12.8 编写属性测试：部分成功语义与三类计数守恒": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235228270
+      }
+    ],
+    "12.9 编写属性测试：清理后的缓存失效范围与索引摘除": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235231720
+      }
+    ],
+    "12.10 编写属性测试：删除路径的调用面白名单": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235236783
+      }
+    ],
+    "14.2 编写属性测试：非显式动作恒不触发全量枚举": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235584682
+      }
+    ],
+    "15.3 编写示例测试 `tests/storage.badge.spec.ts`": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235587581
+      }
+    ],
+    "15. Webview 渲染（`src/webview.ts`）": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235591676
+      }
+    ],
+    "16.5 实现 OpenRankingCommand 与清理结果的 UI 接线": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235678460
+      }
+    ],
+    "16.6 编写示例测试 `tests/storage.ranking.spec.ts`": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235680493
+      }
+    ],
+    "8. Checkpoint - 扫描与孤儿判定": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235681596
+      }
+    ],
+    "17.1 更新 `README.md`": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235682799
+      }
+    ],
+    "16. RankingPanel 与宿主接线（`package.json` / `src/storage/ranking.ts` / `src/extension.ts`）": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235684693
+      }
+    ],
+    "17. 文档": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235685680
+      }
+    ],
+    "18. Final checkpoint - 全量验证": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235710122
+      }
+    ],
+    "13. Checkpoint - 统计与清理内核": [
+      {
+        "executionId": "6f621f34-c0e1-4036-9bf3-c9871168f54f",
+        "chatSessionId": "9f8fb2af-0d80-4521-852d-f1404757d60f",
+        "timestamp": 1788235711240
+      }
+    ]
+  }
+}

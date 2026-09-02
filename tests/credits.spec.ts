@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -9,6 +9,8 @@ import {
   sumCreditsFromUsageSummary,
   getCreditsForSessions,
   storeRootFromSessionDir,
+  listArchiveEntries,
+  dropArchiveEntries,
   __clearCreditCacheForTest,
 } from '../src/credits';
 import {
@@ -20,6 +22,7 @@ import { mkTempDir, rmTempDir } from './_helpers';
 
 const tmpDirs: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   __clearCreditCacheForTest();
   __clearIndexCacheForTest();
   while (tmpDirs.length) rmTempDir(tmpDirs.pop()!);
@@ -364,5 +367,180 @@ describe('search 集成：credits / contextPercentage 流入结果', () => {
     expect(hit).toBeDefined();
     // 必须按 chatSessionId 汇总到 169.9，而不是因 history executionId 无用量而显示 0/undefined
     expect(hit.credits).toBeCloseTo(169.9, 6);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * ArchiveIndex 只读快照与条目摘除
+ * ------------------------------------------------------------------ */
+
+/** 与 credits.ts 的 SCAN_TTL_MS 保持一致（目录扫描节流窗口）。 */
+const SCAN_TTL = 4000;
+
+/**
+ * 用固定时间戳设置 mtime。写入内容后重设为同一时间戳，可保证 stat 读到的
+ * mtimeMs 与首次扫描时完全一致（同一输入 → 同一取整结果），从而稳定地模拟
+ * "内容变了但 (mtime,size) 没变" 的场景。
+ */
+const FIXED_MTIME = new Date(1_700_000_000_000);
+function pinMtime(file: string): void {
+  fs.utimesSync(file, FIXED_MTIME, FIXED_MTIME);
+}
+
+/** 固定 Date.now，用于精确控制 4 秒扫描节流窗口。 */
+function fixedClock(start = 1_700_000_000_000): (t: number) => void {
+  const spy = vi.spyOn(Date, 'now').mockReturnValue(start);
+  return (t: number) => spy.mockReturnValue(start + t);
+}
+
+describe('listArchiveEntries', () => {
+  const WS = 'd:\\test\\archive-ws';
+
+  it('快照字段完整：path / name(hash32(executionId)) / size / chatSessionId', () => {
+    const root = freshDir();
+    const f1 = writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }], {
+      executionId: 'exec-a',
+    });
+    const f2 = writeArchive(root, WS, 'sess-B', null, {
+      omitUsageSummary: true,
+      underSavesFolder: true,
+    });
+
+    const entries = listArchiveEntries(root, { workspacePath: WS });
+    expect(entries).toHaveLength(2);
+
+    const a = entries.find((e) => e.path === f1)!;
+    expect(a).toBeDefined();
+    expect(a.name).toBe(path.basename(f1));
+    expect(a.name).toBe(hash32('exec-a')); // 供 history executionId 反查
+    expect(a.size).toBe(fs.statSync(f1).size);
+    expect(a.chatSessionId).toBe('sess-A');
+
+    const b = entries.find((e) => e.path === f2)!;
+    expect(b).toBeDefined();
+    expect(b.size).toBe(fs.statSync(f2).size);
+    // 无 usageSummary 也照样有 chatSessionId 与字节数
+    expect(b.chatSessionId).toBe('sess-B');
+  });
+
+  it('只覆盖 workspacePath 对应的 workspaceId 目录', () => {
+    const root = freshDir();
+    const mine = writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }]);
+    writeArchive(root, 'd:\\test\\other-ws', 'sess-X', [{ usage: 1, unit: 'credit' }]);
+
+    const entries = listArchiveEntries(root, { workspacePath: WS });
+    expect(entries.map((e) => e.path)).toEqual([mine]);
+  });
+
+  it('重扫时复用缓存条目，不重复读取存档内容（(mtime,size) 未变 → 快照保持原解析结果）', () => {
+    const root = freshDir();
+    const f = writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }]);
+    pinMtime(f);
+
+    const advance = fixedClock();
+    const first = listArchiveEntries(root, { workspacePath: WS });
+    expect(first).toHaveLength(1);
+    expect(first[0].chatSessionId).toBe('sess-A');
+    const size0 = first[0].size;
+
+    // 原地改写内容：字节数不变、mtime 重设为同一时间戳
+    const raw = fs.readFileSync(f, 'utf8');
+    const mutated = raw.replace('"sess-A"', '"sess-Z"');
+    expect(Buffer.byteLength(mutated, 'utf8')).toBe(Buffer.byteLength(raw, 'utf8'));
+    fs.writeFileSync(f, mutated, 'utf8');
+    pinMtime(f);
+
+    // 节流窗口过期 → 目录重扫，但条目 (mtime,size) 未变 → 不重读内容，快照沿用旧解析
+    advance(SCAN_TTL + 1);
+    const second = listArchiveEntries(root, { workspacePath: WS });
+    expect(second).toEqual(first);
+    expect(second[0].chatSessionId).toBe('sess-A');
+
+    // 对照：字节数变化后才会重新解析内容
+    fs.writeFileSync(f, mutated + ' ', 'utf8');
+    pinMtime(f);
+    advance(2 * (SCAN_TTL + 1));
+    const third = listArchiveEntries(root, { workspacePath: WS });
+    expect(third[0].size).toBe(size0 + 1);
+    expect(third[0].chatSessionId).toBe('sess-Z');
+  });
+
+  it('连续调用在 4 秒窗口内不重扫目录，超时后才重扫', () => {
+    const root = freshDir();
+    const f1 = writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }]);
+
+    const advance = fixedClock();
+    expect(listArchiveEntries(root, { workspacePath: WS }).map((e) => e.path)).toEqual([f1]);
+
+    // 窗口内新增的磁盘文件不会被看到——证明没有重新枚举目录
+    const added = writeArchive(root, WS, 'sess-B', [{ usage: 2, unit: 'credit' }]);
+    advance(SCAN_TTL - 1);
+    expect(listArchiveEntries(root, { workspacePath: WS }).map((e) => e.path)).toEqual([f1]);
+    expect(listArchiveEntries(root, { workspacePath: WS }).map((e) => e.path)).toEqual([f1]);
+
+    // 超过 4 秒 → 重扫，新条目出现
+    advance(SCAN_TTL + 1);
+    const after = listArchiveEntries(root, { workspacePath: WS });
+    expect(after.map((e) => e.path).sort()).toEqual([f1, added].sort());
+  });
+});
+
+describe('dropArchiveEntries', () => {
+  const WS = 'd:\\test\\drop-ws';
+
+  it('只摘除给定路径的键并返回摘除数，不触发扫描、不改节流状态', () => {
+    const root = freshDir();
+    const f1 = writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }]);
+    const f2 = writeArchive(root, WS, 'sess-B', [{ usage: 2, unit: 'credit' }]);
+    const f3 = writeArchive(root, WS, 'sess-C', [{ usage: 3, unit: 'credit' }]);
+
+    const advance = fixedClock();
+    expect(listArchiveEntries(root, { workspacePath: WS })).toHaveLength(3);
+
+    // 摘除一条：返回实际摘除数
+    expect(dropArchiveEntries([f2])).toBe(1);
+
+    // 摘除后磁盘新增文件——若 dropArchiveEntries 触发扫描或重置了节流状态，它会立刻出现
+    const addedAfterDrop = writeArchive(root, WS, 'sess-D', [{ usage: 4, unit: 'credit' }]);
+
+    // 节流窗口内的快照：少掉被摘除那条，其余条目不受影响，新文件也未被收录
+    advance(1);
+    expect(
+      listArchiveEntries(root, { workspacePath: WS })
+        .map((e) => e.path)
+        .sort()
+    ).toEqual([f1, f3].sort());
+
+    // 已摘除 / 未登记的路径返回 0
+    expect(dropArchiveEntries([f2])).toBe(0);
+    expect(dropArchiveEntries([path.join(root, 'not-indexed')])).toBe(0);
+    expect(dropArchiveEntries([])).toBe(0);
+    // 混合输入只计实际摘除数
+    expect(dropArchiveEntries([f1, f2, path.join(root, 'nope')])).toBe(1);
+    expect(listArchiveEntries(root, { workspacePath: WS }).map((e) => e.path)).toEqual([f3]);
+
+    // 节流窗口过期后才重扫 → 此时新文件才进入索引
+    advance(SCAN_TTL + 1);
+    expect(
+      listArchiveEntries(root, { workspacePath: WS })
+        .map((e) => e.path)
+        .sort()
+    ).toEqual([f1, f2, f3, addedAfterDrop].sort());
+  });
+
+  it('只动索引不动磁盘：节流窗口过期后重扫会重新收录仍在磁盘上的文件', () => {
+    const root = freshDir();
+    const f1 = writeArchive(root, WS, 'sess-A', [{ usage: 1, unit: 'credit' }]);
+    const f2 = writeArchive(root, WS, 'sess-B', [{ usage: 2, unit: 'credit' }]);
+
+    const advance = fixedClock();
+    expect(listArchiveEntries(root, { workspacePath: WS })).toHaveLength(2);
+    expect(dropArchiveEntries([f2])).toBe(1);
+    expect(listArchiveEntries(root, { workspacePath: WS }).map((e) => e.path)).toEqual([f1]);
+
+    advance(SCAN_TTL + 1);
+    const rescanned = listArchiveEntries(root, { workspacePath: WS });
+    expect(rescanned.map((e) => e.path).sort()).toEqual([f1, f2].sort());
+    expect(fs.existsSync(f2)).toBe(true);
   });
 });

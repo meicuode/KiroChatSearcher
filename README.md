@@ -19,8 +19,143 @@
 - 实时搜索（同时覆盖会话标题与消息内容），最多展示 10 条结果，按修改时间倒序
 - 每条结果显示该对话的**真实 credit 消耗**（来自 Kiro 执行记录），查不到时回退展示上下文占用百分比
 - 命中关键词高亮显示、上下键选择、Enter 跳转、Esc 关闭、120ms 输入防抖
+- 存储占用统计：分类构成、单个会话占用、孤儿执行存档合计，全部**只在用户显式触发时**才扫描磁盘
+- 占用排行页：按占用高低分页展示当前项目全部会话，并提供逐会话的附件清理 / 全量清理入口
 - 完整的环境校验和友好的中文错误提示
 - 安全：Webview 使用 `default-src 'none'` + nonce 的 CSP，所有动态内容经 HTML 转义
+
+## Kiro 1.x 存储适配（与 0.9x 双版本兼容）
+
+Kiro 从 0.9x 升级到 1.x 后聊天历史的磁盘布局被整体重写。本扩展**同时支持两套布局**，
+并在界面上标出每条会话的来源。以下内容均为本机实测（Kiro 1.0.337 / kiro-agent 1.0.653）。
+
+### 两种目录结构
+
+| | 0.9x | 1.x |
+| --- | --- | --- |
+| 会话根 | `<UserDataDir>/User/globalStorage/kiro.kiroagent/workspace-sessions` | `~/.kiro/sessions` |
+| 工作区目录名 | `base64url(workspacePath)` 变体 | `WsHash16` |
+| 单个会话 | 一个文件 `<sessionId>.json` | 一个**目录** `<sessionId>/` |
+| 会话内容 | 该 JSON 文件 | `session.json` + `messages.jsonl` + `snapshots/` + `sub-executions/` + `publish*.cursor` |
+| 会话清单 | `sessions.json` | 无（改为 `~/.kiro/session-index/<WsHash16>.jsonl`，仅计量、不作枚举来源） |
+| 执行存档 | `<StoreRoot>/<WorkspaceId>/<bucket>/<hash32(executionId)>` | 就在会话目录内的 `snapshots/` |
+| 用量数据 | 存档文件里的 `usageSummary` | `messages.jsonl` 的 `usage_summary` 事件 |
+
+### 两种工作区哈希不通用
+
+```
+1.x：WsHash16   = sha256( workspacePath.replace(/\\/g,'/').toLowerCase() ) 的前 16 位十六进制
+0.9x：WorkspaceId = sha256( 原始 workspacePath ) 的前 32 位十六进制（不做任何归一化）
+```
+
+两者**既换了摘要长度也换了归一化规则**，不可互相推导。实测基线：
+`d:\Projects\KiroExt\KiroChatSearcher` → `cc5023603866cd91`，
+`d:\SurErp\ERP-OMS-Workspaces` → `6082f0c94c5c4af8`。
+
+> 迁移标记文件里的 `workspaceHash` 用的是**旧**算法（`sha256(原始路径)` 前 16 位），
+> 与 1.x 的目录名不是一回事，**不能**拿它去定位新目录。
+
+### 四种布局下的行为
+
+扩展启动时判定当前工作区属于哪一种布局，依据是「1.x 工作区目录下是否含至少一个会话子目录」
+与「0.9x 工作区目录下是否含至少一个 `<sessionId>.json`」两个条件的组合：
+
+| 布局 | 含义 | 行为 |
+| --- | --- | --- |
+| `both` | 两侧都有会话 | 合并两侧、按 sessionId 去重（新格式优先）；占用统计同时计量两处 |
+| `new-only` | 只有 1.x | 只读新目录；旧残留维度仍展示（可能有别的工作区的残留） |
+| `old-only` | 只有 0.9x（通常是没升级） | 只读旧目录；跳转追加 0.9x 降级候选；**隐藏**旧残留维度（此时旧目录即主数据） |
+| `none` | 两侧都没有 | 「当前项目还没有 Kiro 对话历史」，面板结构不变 |
+
+状态条 tooltip 会直接显示当前布局与两侧目录，这是判断"扩展在读哪一版数据"最快的入口。
+
+### 会话来源（SessionOrigin）
+
+搜索结果与占用排行的每一行都带一个来源标记：
+
+| 取值 | 标签 | 判定依据 |
+| --- | --- | --- |
+| `new` | 1.x | 位于 1.x 会话目录且 sessionId 以 `sess_` 开头 |
+| `migrated` | 已迁移 | 位于 1.x 会话目录但 sessionId 是裸 uuid；或旧目录里存在 `v2SessionId` 指向它的迁移标记；或同一 sessionId 在新旧两处各有一份 |
+| `legacy-unmigrated` | 未迁移 | 只存在于 0.9x 旧目录 |
+
+> **「未迁移」的会话在 Kiro 1.x 界面中不可见**，点它可能打不开。1.x 的官方迁移是
+> **用户手动触发**的（见 kiro.dev/changelog/ide/1-0-52），因此升级后旧会话不会自动搬走。
+> 需要继续对话请先在 Kiro 内手动迁移；这类数据删除后无法恢复，所以旧残留清理默认把它排除在外。
+
+### credit 用量
+
+1.x 的用量已并入 `messages.jsonl`：逐行取 `payload.type === 'usage_summary'` 的事件，
+累加其中 `unit` 不区分大小写等于 `credit` 的数值；工具使用记录等非 credit 单位项被排除。
+0.9x 的 `hash32(executionId)` → 独立存档文件查表在 1.x 上**完全失效**，故那条路径的适用范围
+已收窄到 0.9x 会话。
+
+**1.x 会话的 `Σ` 开关不改变数值**，两种口径取同一值。原因是 1.x 的快照按会话目录物理隔离，
+不存在跨会话继承，累计口径无从产生差异。角标 tooltip 会写明这一点，以免被理解成开关失效。
+没有任何 `usage_summary` 事件时该条用量标记为不可用、角标被省略，其余结果不受影响。
+
+### 占用分类（新增 4 类）
+
+| 分类 | 对应磁盘位置 |
+| --- | --- |
+| 新格式会话 | `~/.kiro/sessions/<工作区哈希>/<会话 id>/`（含 `session.json`、`messages.jsonl`、`publish*.cursor`） |
+| 新格式快照 | `~/.kiro/sessions/<工作区哈希>/<会话 id>/snapshots/` |
+| 新格式子执行 | `~/.kiro/sessions/<工作区哈希>/<会话 id>/sub-executions/` |
+| 新格式索引 | `~/.kiro/session-index/<工作区哈希>.jsonl` |
+
+1.x 单个会话的占用 = 该会话目录内全部文件字节数之和。排行页的两个字节列被映射为
+「会话本体」（`session.json` + `messages.jsonl` + 其余文件）与「快照/子执行」，合计恒等于两者之和。
+
+### 排行表之上的三个维度
+
+| 维度 | 口径 | 触发方式 |
+| --- | --- | --- |
+| 当前项目会话总占用 | 本工作区全部会话自身占用之和 | 随排行数据一同得出（**同一次枚举**，不额外扫描） |
+| 整个 Kiro 会话总占用 | `~/.kiro/sessions` 下全部工作区目录 | **手动触发** + 缓存；`old-only` 时回退扫 `workspace-sessions` |
+| 旧格式残留 | 0.9x 旧目录里仍在占盘的数据 | **手动触发** + 缓存；与上一项相互独立，默认**不**计入 |
+
+旧残留之所以独立成一个维度：本机实测约 3.6 GB / 7735 文件 / 7 个工作区，把它并进
+「整个 Kiro」会让每次统计都背上这份重量级扫描。**未触发前对应目录一次都不会被枚举。**
+
+`≥` 前缀只在该维度自己存在被跳过条目时出现，表示数值为下限；tooltip 里给出跳过条目数。
+
+### 清理
+
+| 模式 | 0.9x | 1.x |
+| --- | --- | --- |
+| 附件清理 | 删除按 `chatSessionId` 归因的执行存档 | 删除会话目录内 `snapshots/` 与 `sub-executions/` 的文件，**保留** `session.json` 与 `messages.jsonl` |
+| 全量清理 | 存档 + `<sessionId>.json` + 从 `sessions.json` 移除条目 | 删除**整个会话目录**（含消息记录与全部快照），随后移除已清空的目录 |
+| 旧残留清理 | — | 只删「已迁移仅残留」部分；**「未迁移」默认排除**（1.x 里看不见，删了不可恢复） |
+
+**删除不可撤销，被删文件不进回收站。** 每次清理前弹模态确认（「取消」为默认按钮），
+并在删除**前后各写一次**审计到「Kiro 存储占用」输出通道，内容含会话格式、每个被删文件的
+绝对路径与字节数、每个失败/跳过项的原因，以及三类计数。
+
+### 只读与可写边界
+
+除 `src/storage/cleaner.ts` 外，**全部模块只读磁盘**（只做目录枚举、`stat`、读文件），
+且在模块依赖图上连写 API 的 `import` 都不存在——这一点由属性测试静态审查源码来保证，
+不是注释里的承诺。
+
+`cleaner.ts` 的可写 API 白名单：
+
+| API | 实参范围 |
+| --- | --- |
+| `unlink` | 恒 ⊆ 计划已枚举的具体文件 |
+| `rmdir`（**非递归**） | 规范化后位于 `~/.kiro/sessions` 之内、等于目标会话目录或其子目录，且删除前**重新枚举确认为空** |
+| `readFile` / `writeFile` | 只对 0.9x 的 `sessions.json` |
+| `lstat` / `readdir` | 计划快照、TOCTOU 复核与 `rmdir` 前的复核 |
+
+递归删除（`rm` / `rmSync` / `rmdirSync` / `rimraf`）、`rename`、`cp`、`copyFile`、`mkdir`
+一个都没有导入。选非递归 `rmdir` 而非 `rm -r` 的关键理由：**它删不掉非空目录**，
+所以即便实参校验被绕过，最坏后果也只是一次失败而不是数据丢失。
+
+### 统计只在显式动作时执行
+
+只有这些动作会触发全量枚举：左键点击占用统计按钮、打开/翻页/刷新占用排行页、
+触发「整个 Kiro」或「旧格式残留」维度、执行「Kiro: 存储占用分析」命令、以及一次清理结束后的刷新。
+
+面板变可见、输入关键词、切换附件过滤**都不会**触发占用枚举。
 
 ## 激活方式
 
@@ -156,15 +291,22 @@ credit 不单独刷新，而是**挂在每次搜索/列表请求上**：与会�
 
 ## 跳转实现
 
-点击或回车打开结果时，按以下优先级调用 Kiro 内部命令（兼容 Vibe / Spec 会话）：
+候选命令按**当前工作区的存储布局**切换。
 
-1. **`kiroAgent.showExecutionInChatTab(sessionId)`**（主方案）—— 仅加载会话、定位到当前位置，**不发送任何消息**，无副作用。
-2. `kiroAgent.viewSpecSession(sessionId)`（旧版兼容降级）—— 较老的 Kiro 版本使用，新版可能未注册。
-3. `kiroAgent.loadSessionWithPrompt(sessionId, '')`（最后兜底）—— ⚠ 会向会话发送一条空消息，可能污染历史，仅在前两者全不可用时使用。
+**Kiro 1.x（默认，实测 kiro-agent 1.0.653）**
 
-依次尝试，第一个调用成功的即生效；全部失败时弹出错误通知并列出候选命令名，便于排查。跳转成功后搜索面板不会自动关闭，方便继续浏览。
+1. **`kiroAgent.viewSession(sessionId, title?)`**（主方案）—— 内部走 `switchToSidebarSession`，无副作用，Kiro 自身到处在用。标题为空或纯空白时省略第二个参数。
+2. `kiroAgent.sessions.switch(sessionId, undefined, 'local')`（降级）—— `windowId` 必须留空，传了会去 standalone 连接池找那个窗口的 client，找不到就静默返回。
 
-具体每个命令的实测过程与取舍见下一节。
+**Kiro 0.9x（仅 `old-only` 布局，即本工作区在 `~/.kiro/sessions` 下没有任何会话目录时）**
+
+在 1.x 两项之后追加既有三项作为降级候选：`kiroAgent.showExecutionInChatTab` → `kiroAgent.viewSpecSession` → `kiroAgent.loadSessionWithPrompt(sessionId, '')`。
+
+**为什么 1.x 的候选里不含 `loadSessionWithPrompt`**：该命令在 1.x 上仍然注册着，但签名已变为 `(_sessionId, prompt)` —— **sessionId 被忽略**，且会把 prompt 当作一条新用户消息发给**当前**会话。拿它兜底不会打开目标会话，只会往用户正在聊的会话里插一条空消息并触发模型响应。另两个 0.9x 命令（`showExecutionInChatTab` / `viewSpecSession`）在 1.x 的产物里连字符串都搜不到，已被移除。
+
+sessionId 全程**原样传递**：`sess_<uuid>`（1.x 新建）与裸 uuid（迁移而来）都不做前缀改写、补齐或截断。依次尝试，第一个成功的即生效；全部失败时弹出错误通知并列出已尝试的候选命令名。跳转成功后搜索面板不会自动关闭。
+
+下一节是 0.9x 时代的原始研究记录，保留作为背景。
 
 ## 会话跳转方案（研究记录）
 
@@ -271,6 +413,18 @@ src/
   webview.ts          # 搜索面板 HTML/CSS/JS 模板
   webview/format.ts   # 与 webview 共享的纯函数（escapeHtml/highlight/fmtTime/usageLabel）
   webview/filter.ts   # 与 webview 共享的附件过滤纯函数（applyAttachmentFilter）
+  webview/size.ts     # 占用角标 / 汇总条 / 来源角标的纯函数（sizeBadgeLabel/summaryLabel/originBadgeLabel）
+  layout.ts           # LayoutDetector：判定 new-only / old-only / both / none 并解析新旧两套根
+  session/newFormat.ts # NewFormatReader：读 1.x 的 session.json + messages.jsonl
+  session/origin.ts   # SessionOrigin 判定与 MigrationMarker 解析
+  storage/types.ts    # 占用统计的共享数据模型（纯类型 + 文案常量）
+  storage/classify.ts # 路径分类器：0.9x 7 类 + 1.x 4 类，各文件恰好归入一类
+  storage/scanner.ts  # SizeScanner：异步目录枚举 + stat，可注入分类器
+  storage/analyzer.ts # StorageAnalyzer：归因、双布局合并、三个聚合维度、缓存
+  storage/orphan.ts   # 孤儿存档判定（0.9x 特有概念）
+  storage/ranking.ts  # 占用排行页：取数 + 纯函数 + HTML + 面板生命周期
+  storage/report.ts   # 存储占用分析报告的聚合与文本渲染（纯函数）
+  storage/cleaner.ts  # SessionCleaner：本项目唯一可写磁盘的模块
 tests/                # vitest 单元测试与 fast-check 属性测试
 ```
 
