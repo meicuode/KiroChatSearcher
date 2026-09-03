@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import * as fs from 'fs';
 import * as ts from 'typescript';
 import { getRankingHtml } from '../src/storage/ranking';
+import { getSettingsHtml } from '../src/settings';
 import { getWebviewHtml } from '../src/webview';
 
 /**
@@ -233,6 +234,11 @@ describe('内联脚本启动 - ESM 路径（抓脚本自身的运行时错误）
     const { posted } = runInlineScript(html, NONCE);
     expect(posted).toContainEqual({ type: 'ready' });
   });
+
+  it('设置页脚本执行不抛错，并发出 ready', () => {
+    const { posted } = runInlineScript(getSettingsHtml('vscode-webview://kcs', NONCE), NONCE);
+    expect(posted).toContainEqual({ type: 'ready' });
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -257,6 +263,18 @@ describe('内联脚本启动 - CJS 路径（抓 tsc 的 exports. / mod_1. 重写
     );
     const { script, posted } = runInlineScript(html, NONCE);
     expectNoCjsRewriteLeak(script, '搜索面板');
+    expect(posted).toContainEqual({ type: 'ready' });
+  });
+
+  // 设置页注入 `turnTimerStatusLabel`，且它是跨模块 import 进来的（`src/webview/turnTimer.ts`）
+  // ——正是最容易被 tsc 重写成 `mod_1.X` 的形态，故这一档尤其必要。
+  it('设置页：CommonJS 编译形态下脚本仍能执行并发出 ready，且脚本文本无重写泄漏', () => {
+    const mod = loadAsCommonJs<typeof import('../src/settings')>('../src/settings.ts');
+    const { script, posted } = runInlineScript(
+      mod.getSettingsHtml('vscode-webview://kcs', NONCE),
+      NONCE
+    );
+    expectNoCjsRewriteLeak(script, '设置页');
     expect(posted).toContainEqual({ type: 'ready' });
   });
 });

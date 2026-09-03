@@ -381,6 +381,12 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
         <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
       </svg>
     </span>
+    <span id="settings" class="refresh-btn" title="设置（对话过程中显示耗时等）" role="button" aria-label="设置">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.9 14.6a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-2.88 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.88-1.2l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 3.1 14H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.2-2.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 10 3.1V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.88 1.2l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 20.9 10H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1 .6z"/>
+      </svg>
+    </span>
   </div>
   <ul id="results" class="results"></ul>
 
@@ -396,6 +402,7 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   const $filters = document.querySelectorAll('.filter-chip[data-mode]');
   const $clear = document.getElementById('clear');
   const $refresh = document.getElementById('refresh');
+  const $settings = document.getElementById('settings');
   const $creditMode = document.getElementById('creditMode');
   const $computeSize = document.getElementById('computeSize');
   const $summary = document.getElementById('summary');
@@ -579,6 +586,12 @@ export function getWebviewHtml(webview: vscode.Webview, nonce: string): string {
   $refresh.addEventListener('click', () => {
     $refresh.classList.add('spinning');
     vscode.postMessage({ type: 'hardRefresh' });
+  });
+
+  // 设置入口：宿主打开独立的设置面板（与 openRanking 同一手法——前端只表达意图，
+  // 具体开哪个面板、怎么探测由宿主决定）。
+  $settings.addEventListener('click', () => {
+    vscode.postMessage({ type: 'openSettings' });
   });
 
   // credit 展示口径切换：self（自身消耗）<-> lineage（整段累计）。

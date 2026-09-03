@@ -29,6 +29,16 @@ import {
   type ConfirmPrompt,
 } from './storage/cleaner';
 import { buildClassifyRoots } from './storage/classify';
+import { SettingsPanel, type SettingsPanelDeps } from './settings';
+import {
+  applyTurnTimer,
+  detectTurnTimer,
+  hostStartedAt,
+  revertTurnTimer,
+  type TurnTimerActionResult,
+  type TurnTimerOptions,
+  type TurnTimerStatus,
+} from './turnTimer';
 import { encodeWorkspaceKeys, getKiroUserDataDir } from './paths';
 import { dropArchiveEntries, listArchiveEntries, workspaceIdCandidates } from './credits';
 import { formatSize } from './webview/size';
@@ -68,6 +78,187 @@ function getStorageOutputChannel(): vscode.OutputChannel {
 function appendStorageAudit(lines: readonly string[]): void {
   const channel = getStorageOutputChannel();
   for (const line of lines) channel.appendLine(line);
+}
+
+// ---------------------------------------------------------------------------
+// 对话耗时补丁（TurnTimerPatch）的宿主侧生命周期
+//
+// 这一节是本扩展唯一会**写 Kiro 安装目录**的代码路径：把
+// `media/kcs-turn-timer.js` 覆盖到 Kiro 对话面板的产物目录，并在两个入口文件末尾
+// 追加一行 import。原理、安全性与还原方式见 `src/turnTimer.ts` 的模块注释。
+//
+// 三个设计取舍：
+//
+// 1. **意图与实况分开存放。** 意图（开/关）在 `globalState`；实况每次都真读磁盘。
+//    Kiro 升级会静默抹掉补丁，任何缓存下来的「已生效」都会变成谎言。
+// 2. **`activate()` 里按意图自动补齐。** 这同时覆盖了「插件首次安装」与
+//    「Kiro 升级后补丁被抹掉」两种情形，而不需要维护版本号比对。默认值为 `true`，
+//    所以首次安装即自动写入一次；用户在设置页关掉后 `globalState` 记下 `false`，
+//    后续启动不再自动写。
+// 3. **首次真正写入时给一次非模态提示。** 悄悄改另一个应用的安装文件不合适；
+//    而且补丁要重载窗口才生效，这个提示同时充当重载入口。之后的启动若无改动则静默。
+// ---------------------------------------------------------------------------
+
+/** `globalState` 里存「对话过程中显示耗时」意图的键。 */
+const TURN_TIMER_ENABLED_KEY = 'kiroChatSearch.turnTimer.enabled';
+
+/** 已就该失败原因提示过用户的签名，避免每次启动都弹同一条警告。 */
+const TURN_TIMER_NOTIFIED_KEY = 'kiroChatSearch.turnTimer.notified';
+
+/**
+ * 本窗口扩展宿主的启动时刻。**在模块加载期求值**（早于 `activate()`）：
+ * `activate()` 可能被「视图首次展开」推迟很久，那时取的时刻会晚于对话面板 webview
+ * 的创建时刻，于是「补丁晚于窗口启动」的判断会假阳性、把已生效的补丁报成需重载。
+ */
+const EXTENSION_HOST_STARTED_AT = hostStartedAt();
+
+/**
+ * 本窗口启动后是否动过补丁文件。
+ *
+ * 动过就意味着当前这个 Kiro 窗口的对话面板加载的是**旧**产物——webview 只在创建时
+ * 读一次入口文件。开与关都成立（刚关掉时，正在跑的那个面板里计时器还在），
+ * 所以这是个单向标志，只有重载窗口（整个扩展宿主重启、本标志随之归零）才会清掉。
+ */
+let turnTimerDirty = false;
+
+/** 本扩展自己的 OutputChannel（与「Kiro 存储占用」分开，避免报告 `clear()` 冲掉审计）。 */
+let extensionOutputChannel: vscode.OutputChannel | undefined;
+
+function getExtensionOutputChannel(): vscode.OutputChannel {
+  if (!extensionOutputChannel) {
+    extensionOutputChannel = vscode.window.createOutputChannel('Kiro Chat Search');
+  }
+  return extensionOutputChannel;
+}
+
+function logTurnTimer(message: string): void {
+  try {
+    getExtensionOutputChannel().appendLine(new Date().toISOString() + ' ' + message);
+  } catch {
+    /* 记不了日志不影响功能 */
+  }
+}
+
+/**
+ * 组装 `turnTimer.ts` 需要的入参。
+ *
+ * `vscode.env.appRoot` 就是 `<KiroRoot>/resources/app`，比从 PATH 或常见安装位置去猜
+ * 可靠得多——扩展本来就跑在目标 Kiro 进程里，问它自己的安装位置不会错。
+ */
+function turnTimerOptions(context: vscode.ExtensionContext): TurnTimerOptions {
+  return {
+    appRoot: vscode.env.appRoot,
+    assetPath: vscode.Uri.joinPath(context.extensionUri, 'media', 'kcs-turn-timer.js').fsPath,
+    hostStartedAt: EXTENSION_HOST_STARTED_AT,
+  };
+}
+
+/** 读意图。缺省 `true`：首次安装即自动写入一次。 */
+function isTurnTimerEnabled(context: vscode.ExtensionContext): boolean {
+  return context.globalState.get<boolean>(TURN_TIMER_ENABLED_KEY, true) !== false;
+}
+
+async function setTurnTimerEnabled(
+  context: vscode.ExtensionContext,
+  enabled: boolean
+): Promise<void> {
+  await context.globalState.update(TURN_TIMER_ENABLED_KEY, enabled);
+}
+
+/**
+ * 执行一次补丁动作，并把「本窗口已过期」标志推到位。
+ *
+ * 所有写 Kiro 安装目录的调用都必须经这里，否则 `turnTimerDirty` 会漏置，
+ * 设置页就会把「文件已改但面板还是旧的」误报成「已生效」。
+ */
+function runTurnTimerAction(
+  context: vscode.ExtensionContext,
+  kind: 'apply' | 'revert'
+): TurnTimerActionResult {
+  const opts = turnTimerOptions(context);
+  const result = kind === 'apply' ? applyTurnTimer(opts) : revertTurnTimer(opts);
+  if (result.changed) turnTimerDirty = true;
+  logTurnTimer(
+    `[turnTimer] ${kind} ok=${result.ok} changed=${result.changed} state=${result.status.state}` +
+      (result.error ? '\n  ' + result.error.split('\n').join('\n  ') : '')
+  );
+  return result;
+}
+
+/**
+ * `activate()` 里的自动补齐：意图为开而实况没到位时写一次。
+ *
+ * 什么都不做的情形（都是正常的，不提示、不记账）：
+ * - 意图为关
+ * - 环境不支持（不在 Kiro 里、或版本布局变了 → `unavailable`）
+ * - 已经到位（`on`）或已写好只等重载（`pending-reload`）
+ *
+ * 失败时按「错误签名」去重提示：只读安装目录会让每次启动都失败，弹同一条警告
+ * 只会变成噪音，所以同一签名只提示一次，之后靠设置页呈现。
+ */
+async function syncTurnTimerOnActivate(context: vscode.ExtensionContext): Promise<void> {
+  if (!isTurnTimerEnabled(context)) return;
+
+  let state: TurnTimerStatus['state'];
+  try {
+    state = detectTurnTimer(turnTimerOptions(context)).state;
+  } catch {
+    return;
+  }
+  if (state === 'unavailable' || state === 'on' || state === 'pending-reload') return;
+
+  const result = runTurnTimerAction(context, 'apply');
+
+  if (!result.ok) {
+    const signature = 'fail:' + (result.error ?? '').slice(0, 200);
+    if (context.globalState.get<string>(TURN_TIMER_NOTIFIED_KEY) === signature) return;
+    await context.globalState.update(TURN_TIMER_NOTIFIED_KEY, signature);
+    const pick = await vscode.window.showWarningMessage(
+      '未能为 Kiro 对话面板启用「对话过程中显示耗时」。',
+      '打开设置',
+      '查看日志'
+    );
+    if (pick === '打开设置') openSettingsPanel(context);
+    else if (pick === '查看日志') getExtensionOutputChannel().show(true);
+    return;
+  }
+
+  if (!result.changed) return;
+
+  // 真正写入了：这一次值得说一句——既因为我们改了 Kiro 的安装文件，
+  // 也因为补丁要重载窗口才会生效。
+  await context.globalState.update(TURN_TIMER_NOTIFIED_KEY, 'ok');
+  const pick = await vscode.window.showInformationMessage(
+    'Kiro Chat Search 已为对话面板启用「对话过程中显示耗时」，重载窗口后生效。',
+    '重载窗口',
+    '打开设置',
+    '不需要'
+  );
+  if (pick === '重载窗口') {
+    await vscode.commands.executeCommand('workbench.action.reloadWindow');
+  } else if (pick === '打开设置') {
+    openSettingsPanel(context);
+  } else if (pick === '不需要') {
+    await setTurnTimerEnabled(context, false);
+    runTurnTimerAction(context, 'revert');
+  }
+}
+
+/** 设置页命令与齿轮入口的落点：装配宿主能力后打开单例面板。 */
+function openSettingsPanel(context: vscode.ExtensionContext): void {
+  const deps: SettingsPanelDeps = {
+    detect: () => detectTurnTimer(turnTimerOptions(context)),
+    apply: () => runTurnTimerAction(context, 'apply'),
+    revert: () => runTurnTimerAction(context, 'revert'),
+    getEnabled: () => isTurnTimerEnabled(context),
+    setEnabled: (enabled: boolean) => setTurnTimerEnabled(context, enabled),
+    isDirty: () => turnTimerDirty,
+    reloadWindow: async () => {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    },
+    log: (message: string) => logTurnTimer(message),
+  };
+  SettingsPanel.showOrCreate(context, deps);
 }
 
 /**
@@ -505,7 +696,40 @@ async function runLegacyResidueCleanup(): Promise<CleanupResult | null> {
   }
 }
 
-/** `RankingPanel` 的宿主侧依赖装配（取数 / 清理 / 工作区 / 日志）。 */
+/**
+ * 按 sessionId 打开一条会话：搜索面板与排行页 SessionTitleLink 的**共用**跳转入口。
+ *
+ * 收在一处的理由：候选链的选择（1.x 两项，`old-only` 时追加 0.9x 三项）、命令全不可用时的
+ * 中文提示都归 `jump.ts`，两个消费方只需给出「哪条会话 + 已知的标题与数据格式」。
+ * 各自再写一遍 deps 装配，迟早会出现一边传了 `layout`、另一边忘传而退回 0.9x 候选链的偏差。
+ *
+ * `layout` 在**调用时**现取：面板可能已经开着很久，其间用户可能完成了迁移，候选链应按
+ * 当前布局判定，而不是面板创建那一刻的结论。
+ *
+ * 恒不抛异常：失败的用户可见提示由 `showError` 在 jump 内部给出，调用方据返回值留痕即可。
+ */
+async function openSessionByJump(target: {
+  sessionId: string;
+  title?: string;
+  sessionLayout?: 'old' | 'new';
+}): Promise<{ invoked: boolean }> {
+  const jumpTarget: JumpTarget = { sessionId: target.sessionId, layout: checkEnv().layout };
+  if (typeof target.title === 'string' && target.title.trim() !== '') {
+    jumpTarget.title = target.title;
+  }
+  if (target.sessionLayout === 'old' || target.sessionLayout === 'new') {
+    jumpTarget.sessionLayout = target.sessionLayout;
+  }
+  const res = await resolveAndExecuteJumpCommand(jumpTarget, {
+    getCommands: (filterInternal) =>
+      Promise.resolve(vscode.commands.getCommands(filterInternal)),
+    executeCommand: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+    showError: (message) => vscode.window.showErrorMessage(message),
+  });
+  return { invoked: res.invoked === true };
+}
+
+/** `RankingPanel` 的宿主侧依赖装配（取数 / 清理 / 跳转 / 工作区 / 日志）。 */
 function buildRankingDeps(): RankingPanelDeps {
   const analyzer = getHostAnalyzer();
   return {
@@ -542,6 +766,11 @@ function buildRankingDeps(): RankingPanelDeps {
     // `old-only` 下隐藏旧残留维度（Req 8.3）
     layout: checkEnv().layout,
     cleaner: { run: (mode, sessionId, title) => runSessionCleanup(mode, sessionId, title) },
+    // SessionTitleLink：点击排行页的会话标题打开该对话。
+    // 与搜索面板的 `open` 走**同一个** jump 入口与同一套 deps（候选链、失败提示都在 jump 一侧），
+    // 排行页因此不需要自己认识任何 kiroAgent.* 命令。
+    // `layout` 现取（而不是复用上面那次 checkEnv）：面板可能开着很久，跳转时应按当前布局判候选链。
+    openSession: (target) => openSessionByJump(target),
     workspacePath: currentWorkspaceFolder()?.uri.fsPath ?? null,
     // 排行页的诊断信息写进与报告、审计同一处文本流
     log: (message) => appendStorageAudit([message]),
@@ -755,6 +984,10 @@ class SearchSession {
         // ComputeSizeButton 右键：打开占用排行页，不改变 SummaryBar 当前状态（Req 4.7）。
         vscode.commands.executeCommand('kiroChatSearch.storageRanking');
         break;
+      case 'openSettings':
+        // 过滤条右下角的齿轮：打开设置页（对话耗时显示等）。与 openRanking 同一手法。
+        vscode.commands.executeCommand('kiroChatSearch.settings');
+        break;
       // 'close' 由调用方（SearchPanel）单独监听并 dispose 面板
     }
   }
@@ -945,17 +1178,12 @@ class SearchSession {
    */
   private async openSession(sessionId: string) {
     const hit = (this.lastResults as SearchHit[]).find((r) => r?.sessionId === sessionId);
-    const target: JumpTarget = { sessionId, layout: checkEnv().layout };
-    if (hit) {
-      if (typeof hit.title === 'string') target.title = hit.title;
-      if (hit.layout === 'old' || hit.layout === 'new') target.sessionLayout = hit.layout;
-    }
-    await resolveAndExecuteJumpCommand(target, {
-      getCommands: (filterInternal) =>
-        Promise.resolve(vscode.commands.getCommands(filterInternal)),
-      executeCommand: (command, ...args) =>
-        vscode.commands.executeCommand(command, ...args),
-      showError: (message) => vscode.window.showErrorMessage(message),
+    // 候选链推导与失败提示都在 openSessionByJump / jump.ts 一侧，与排行页的
+    // SessionTitleLink 共用同一入口，避免两处各自装配 deps 后出现偏差
+    await openSessionByJump({
+      sessionId,
+      title: typeof hit?.title === 'string' ? hit.title : undefined,
+      sessionLayout: hit?.layout === 'old' || hit?.layout === 'new' ? hit.layout : undefined,
     });
   }
 }
@@ -1098,6 +1326,12 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
+  // 设置页命令（package.json 已注册标题「Kiro: 设置」）。
+  // 也是搜索面板过滤条右下角齿轮的落点（`openSettings` 消息执行的就是本命令）。
+  context.subscriptions.push(
+    vscode.commands.registerCommand('kiroChatSearch.settings', () => openSettingsPanel(context))
+  );
+
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       'kiroChatSearch.entry',
@@ -1105,6 +1339,10 @@ export function activate(context: vscode.ExtensionContext) {
       { webviewOptions: { retainContextWhenHidden: true } }
     )
   );
+
+  // 对话耗时补丁的自动补齐放在最后：命令已注册，通知里的「打开设置」按钮才一定可用。
+  // 不 await——它只做几次小文件读写，但没有理由让它挡住 activate 的返回。
+  void syncTurnTimerOnActivate(context);
 }
 
 export function deactivate() {}

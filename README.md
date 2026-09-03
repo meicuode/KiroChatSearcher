@@ -20,7 +20,8 @@
 - 每条结果显示该对话的**真实 credit 消耗**（来自 Kiro 执行记录），查不到时回退展示上下文占用百分比
 - 命中关键词高亮显示、上下键选择、Enter 跳转、Esc 关闭、120ms 输入防抖
 - 存储占用统计：分类构成、单个会话占用、孤儿执行存档合计，全部**只在用户显式触发时**才扫描磁盘
-- 占用排行页：按占用高低分页展示当前项目全部会话，并提供逐会话的附件清理 / 全量清理入口
+- 占用排行页：按占用高低分页展示当前项目全部会话，标题可点击直接打开该对话，并提供逐会话的附件清理 / 全量清理入口
+- 设置页（过滤条右下角齿轮）：开关「在对话过程中显示耗时」，并能检测该设置**实际是否生效**、一键重试与重载窗口
 - 完整的环境校验和友好的中文错误提示
 - 安全：Webview 使用 `default-src 'none'` + nonce 的 CSP，所有动态内容经 HTML 转义
 
@@ -119,6 +120,22 @@ Kiro 从 0.9x 升级到 1.x 后聊天历史的磁盘布局被整体重写。本�
 
 `≥` 前缀只在该维度自己存在被跳过条目时出现，表示数值为下限；tooltip 里给出跳过条目数。
 
+### 点击标题打开对话
+
+排行页每行的**会话标题是链接**：点击（或 Tab 聚焦后按 Enter / Space）即打开该会话，
+走的是与搜索结果点击**完全相同**的跳转候选链，失败提示也一致。点开后排行页保持打开，
+当前页码与排序方向不变，方便接着看下一条。
+
+实现上刻意**不用** `<a href>`：本页不做任何导航，sessionId 不进入任何 URL，因此既没有
+可被"复制链接地址"的面，也不需要放宽 CSP（仍是 `default-src 'none'` + nonce，无内联事件处理器）。
+跳转参数里的标题与会话格式取自扩展**自己刚下发的那批行**，而非 webview 回传的值。
+
+统计中 / 空态 / 未打开工作区 / 统计不可用这四种状态下，标题退回普通文本、不可点击。
+跳转失败只写一行审计日志，不会把整页打成不可用。
+
+> 「Kiro: 存储占用分析」输出的是**纯文本报告**（写入输出通道），输出通道不支持可点击的
+> 命令链接，因此那份报告里的会话排行无法点击打开——需要点击就用排行页。
+
 ### 清理
 
 | 模式 | 0.9x | 1.x |
@@ -157,12 +174,147 @@ Kiro 从 0.9x 升级到 1.x 后聊天历史的磁盘布局被整体重写。本�
 
 面板变可见、输入关键词、切换附件过滤**都不会**触发占用枚举。
 
+## 对话过程中显示耗时（TurnTimerPatch）
+
+Kiro 自带的对话面板**只在一轮结束后**才显示 `Elapsed time`（数据来自 `messages.jsonl`
+的 `usage_summary.elapsedTime`）。AI 还在输出时没有任何耗时显示。本扩展补上这段空窗：
+开启后，消息流底部会实时显示本轮已耗时，一轮结束即消失、交回 Kiro 原生那一行。
+
+入口：搜索面板过滤条**右下角的齿轮**，或命令 `Kiro: 对话搜索设置`（`kiroChatSearch.settings`）。
+
+### 为什么需要打补丁
+
+对话面板是 `kiro.kiro-agent` 扩展提供的 webview（`kiroAgent.chatView` /
+`kiroAgent.standaloneChatView`），UI 是 Vite 打出来的 React 应用。VSCode 扩展 API
+**没有**往别的扩展的 webview 里注入内容的口子，所以只能改它磁盘上的产物。
+
+### 具体改了什么
+
+```
+<Kiro>/resources/app/extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/
+  kcs-turn-timer.js          # 新增：注入的 ES module（内容 = 本仓库 media/kcs-turn-timer.js）
+  session-manager/main.js    # 末尾追加一行 import；追加前整份备份为 main.js.kcs-orig
+  session-view/main.js       # 同上
+  standalone/main.js         # 同上
+```
+
+三个入口对应三个界面，都要打：
+
+| 入口 | 界面 | 视图 / 来源 |
+| --- | --- | --- |
+| `session-manager` | **侧边栏**对话面板（日常用得最多） | `kiroAgent.chatView` |
+| `session-view` | 编辑器分栏里打开的单会话面板 | `buildEditorPanel` |
+| `standalone` | 独立对话窗口 | `kiroAgent.standaloneChatView` |
+
+这点很容易搞错：`AgentChatViewProvider` 的 `entryPoint` **默认值**是 `session-view`，
+但侧边栏那个 provider 是显式用 `entryPoint:"session-manager"` 构造的。只打
+`session-view` 的话，编辑器分栏和独立窗口有效、而侧边栏毫无反应。
+
+入口文件是几百字节的 ESM loader，补丁只在末尾追加
+
+```js
+import "../kcs-turn-timer.js"; /* kcs-turn-timer */
+```
+
+其余字节一个都不动。样式走内联 `<style>`（面板 CSP 的 `style-src` 含 `'unsafe-inline'`），
+所以 `dist/style.css` 完全没被碰过。
+
+三个核对过的事实（Kiro 1.0.337）：
+
+- **CSP 放行**：面板 `script-src` 是 `<webview.cspSource> 'nonce-…' 'wasm-unsafe-eval'`，
+  cspSource 覆盖整个 webview 资源源，同目录 ESM import 无需 nonce
+- **不触发「安装似已损坏」**：`product.json` 的 `checksums` 只覆盖 6 个核心 workbench
+  文件，不含任何扩展 bundle
+- **可还原**：优先拷回 `.kcs-orig` 备份（字节精确）；备份丢了则按标记摘掉那一行
+
+### 显示位置与兜底
+
+计时行插在消息流滚动容器 `.session-view-content` 的末尾，复用 Kiro 自己的
+`kiro-turn-usage-summary` 类名，所以间距、字号、颜色与原生那行一致。
+
+找不到该容器时（Kiro 改版换了类名，或面板尚未挂载完）**不会消失**，而是退化成右下角
+的浮动小徽标，并在控制台打一条锚点告警；容器随后出现时会自动升级回行内显示。
+这么做是为了让「锚点失效」的症状是「位置怪」而不是「彻底看不见」——后者会让人
+误以为补丁没生效，无从下手排查。
+
+已知限制：Kiro 的 DOM 里没有任何带 sessionId 的标记，因此多会话并行跑时，计时行会
+出现在**当前可见**的那个会话的消息流底部，不一定是正在跑的那个。单会话无此问题。
+
+### 怎么排查
+
+注入脚本跑在 Kiro 自己的 webview 里，**从扩展侧看不到它的任何输出**（控制台不落盘、
+也拿不到那边的 DOM）。所以它自带一个诊断快照：命令面板 →
+`Developer: Open Webview Developer Tools`，在控制台敲
+
+```js
+__kcsTurnTimer
+// { version: 2, hooked: true, hookError: '', turns: 3, anchor: 'inline', running: 0 }
+```
+
+- `hooked: false` → 钩子没装上，`hookError` 说明原因（实时耗时一定不会出现）
+- `turns: 0` 而你已经发过消息 → RPC 形态变了，`prompt` 请求没被认出来
+- `anchor: 'floating'` → 锚点类名失效，已退化成右下角浮动显示
+- 脚本就绪 / 失败时也会各打一条 `console.info` / `console.error`
+
+### 钩子为什么是「替换 window.vscode」而不是「包一层 postMessage」
+
+`acquireVsCodeApi()` 返回的是 **`Object.freeze({postMessage, setState, getState})`**
+（见 vscode 的 webview preload）。所以 `window.vscode.postMessage = wrapper`
+在严格模式下抛 `TypeError: Cannot assign to read only property`、非严格模式下静默失败
+——两种都装不上钩子。这个坑很隐蔽：代码看着对、不报错、就是不工作。
+
+`window.vscode` 本身只是 HTML 内联脚本赋的普通全局属性（可写），因此改成**整体替换成
+一个转发 shim**，逐个转发原对象的成员，参数用 `...args` 原样透传
+（`postMessage(message, transfer)` 有第二个参数）。三个入口的 bundle 都是
+`n => window.vscode.postMessage(n)` ——**调用时**才读 `window.vscode`，而注入模块作为
+`import` 会在宿主 bundle 的模块体之前求值，所以它们看到的就是 shim。
+
+### 怎么判断一轮的起止
+
+不猜 DOM、不碰 React 内部状态，而是监听 webview ↔ 扩展的 RPC：
+
+| 方向 | 消息 | 含义 |
+| --- | --- | --- |
+| webview → 扩展 | `{type:'request', id, key:'prompt', …}` | 轮开始 |
+| 扩展 → webview | `{type:'response'\|'error', id, …}` | 轮结束 |
+
+`prompt` 是长活 RPC——扩展侧直接 `return client.prompt(...)`，要到整轮出 stopReason
+才 resolve；面板自己也是 `setAgentActive(true)` → `await ("prompt", …)` →
+`finally { setAgentActive(false) }`。所以这两个信号的精度等于 Kiro 自己的
+agentActive，且不依赖 minified 代码里的任何符号名。中途 steer 不重置计时，
+点停止也无需特殊处理。
+
+### 「设置了」与「生效了」是两件事
+
+对话面板是 webview，**只在创建时读一次**入口文件。所以写完补丁必须重载窗口才会跑起来。
+设置页因此把两件事分开呈现：
+
+- **意图**：开关状态，存在 `globalState`（键 `kiroChatSearch.turnTimer.enabled`，缺省为开）
+- **实况**：每次都真读磁盘（不缓存——Kiro 可能在两次询问之间升级并抹掉补丁）
+
+状态行的五种结论：`已生效` / `已写入，重载窗口后生效` / `只注入了一部分` /
+`未生效：补丁不在了` / `已关闭`。需要时给出「重试」与「重载窗口」按钮。
+「重试」= 按当前意图重跑一次，因此意图为「关」而磁盘上有残留时，它是清除入口。
+
+### 自动写入的时机
+
+扩展启动时（`onStartupFinished`）若「意图为开而实况没到位」就写一次。这同时覆盖
+两种情形，无需维护版本号比对：
+
+- 插件首次安装（意图缺省为开）
+- Kiro 升级覆盖了 dist、抹掉了补丁
+
+**首次真正写入**时会弹一条非模态提示（带「重载窗口」/「打开设置」/「不需要」），
+之后若无改动则静默。写入失败按错误签名去重提示，只读安装目录不会变成每次启动的噪音。
+在设置页关掉后 `globalState` 记为 `false`，后续启动不再自动写。
+
 ## 激活方式
 
 - **活动栏入口**：左侧活动栏的 Kiro Chat Search 图标，点击后在入口面板按"🔍 打开搜索"
 - **快捷键**：`Ctrl+Alt+K`（Windows / Linux）/ `Cmd+Alt+K`（macOS）打开居中搜索面板
 - **折叠/展开**：`Ctrl+Alt+J`（Windows / Linux）/ `Cmd+Alt+J`（macOS）一键收起或聚焦侧边栏搜索视图，编辑代码时腾出空间
 - **命令面板**：执行命令 `Kiro: 搜索对话历史`（`kiroChatSearch.openSearch`）或 `Kiro: 折叠/展开对话搜索`（`kiroChatSearch.toggleView`）
+- **设置页**：过滤条右下角齿轮，或命令 `Kiro: 对话搜索设置`（`kiroChatSearch.settings`）
 
 ## 搜索规则
 
@@ -424,7 +576,12 @@ src/
   storage/orphan.ts   # 孤儿存档判定（0.9x 特有概念）
   storage/ranking.ts  # 占用排行页：取数 + 纯函数 + HTML + 面板生命周期
   storage/report.ts   # 存储占用分析报告的聚合与文本渲染（纯函数）
-  storage/cleaner.ts  # SessionCleaner：本项目唯一可写磁盘的模块
+  storage/cleaner.ts  # SessionCleaner：清理会话数据，可写磁盘
+  turnTimer.ts        # TurnTimerPatch：探测 / 注入 / 还原对话面板补丁，唯一会写 Kiro 安装目录的模块
+  settings.ts         # 设置页：HTML（纯函数）+ 面板生命周期，注入宿主能力便于测试
+  webview/turnTimer.ts # 设置页状态行文案的纯函数（turnTimerStatusLabel）
+media/
+  kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）
 tests/                # vitest 单元测试与 fast-check 属性测试
 ```
 
