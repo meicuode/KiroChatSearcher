@@ -48,8 +48,22 @@ export interface PendingInteraction {
   at: number | null;
 }
 
+/** 一次会话扫描的产出：谁在等确认，以及最后一次「轮结束」是哪一个。 */
+export interface SessionActivity {
+  /** 仍在等待人工处理的交互。 */
+  pending: PendingInteraction[];
+  /**
+   * 最后一个 `turn_end` 事件的**身份**（优先取事件 id，退回时间戳），没有则为 `null`。
+   *
+   * 用「身份」而不是「计数」：MessagesFile 只读尾部窗口，文件长大后窗口会往后滑动，
+   * 窗口内的 `turn_end` **条数可能减少**——拿计数比对会把「又完成了一轮」误判成没变，
+   * 或反过来。事件 id 全局唯一，窗口怎么滑都不影响比对。
+   */
+  lastTurnEndId: string | null;
+}
+
 /**
- * 从 MessagesFile 文本里找出**仍在等待**的交互。
+ * 从 MessagesFile 文本里找出**仍在等待**的交互（{@link scanSessionActivity} 的薄封装）。
  *
  * 判据两条，缺一不可：
  * 1. 没有同 `toolCallId` 的 `interaction_resolved`
@@ -67,8 +81,19 @@ export interface PendingInteraction {
  * 把「已处理」误判成「在等」。
  */
 export function scanPendingInteractions(raw: string): PendingInteraction[] {
+  return scanSessionActivity(raw).pending;
+}
+
+/**
+ * 一次遍历同时得出「谁在等确认」与「最后一次轮结束的身份」。
+ *
+ * 两件事合在一次遍历里，是因为它们读的是同一批行、判据还互相牵连
+ * （`turn_end` 既作废先前的 pending，又是「完成」的信号）。
+ */
+export function scanSessionActivity(raw: string): SessionActivity {
   const pending = new Map<string, PendingInteraction>();
   const resolved = new Set<string>();
+  let lastTurnEndId: string | null = null;
 
   for (const line of raw.split(/\r?\n/)) {
     if (!line) continue;
@@ -99,6 +124,10 @@ export function scanPendingInteractions(raw: string): PendingInteraction[] {
       // 轮结束 ⇒ 此刻之前的一切 pending 都不再有人等
       pending.clear();
       resolved.clear();
+      const id = (event as { id?: unknown }).id;
+      const ts = (event as { timestamp?: unknown }).timestamp;
+      if (typeof id === 'string' && id) lastTurnEndId = id;
+      else if (typeof ts === 'string' && ts) lastTurnEndId = ts;
       continue;
     }
 
@@ -118,7 +147,10 @@ export function scanPendingInteractions(raw: string): PendingInteraction[] {
     }
   }
 
-  return [...pending.values()].filter((it) => !resolved.has(it.toolCallId));
+  return {
+    pending: [...pending.values()].filter((it) => !resolved.has(it.toolCallId)),
+    lastTurnEndId,
+  };
 }
 
 function parseTimestamp(v: unknown): number | null {
@@ -181,11 +213,19 @@ export function stripAnyMark(title: string, marks: readonly string[]): string {
  * - 结尾没有空白就补一个：否则会渲染成 `🔴Kiro Chat Search`，emoji 和文字黏在一起
  *   （用户配的时候很容易忘掉那个空格）
  */
-export function normalizeMark(mark: string): string {
+export function normalizeMark(mark: string, fallback: string = DEFAULT_TITLE_MARK): string {
   const raw = typeof mark === 'string' ? mark : '';
-  if (!raw.trim()) return DEFAULT_TITLE_MARK;
+  if (!raw.trim()) return fallback;
   return /\s$/.test(raw) ? raw : raw + ' ';
 }
+
+/**
+ * 「刚跑完一轮」的默认标记：白底对勾 + 空格。
+ *
+ * 与待确认的 🔴 并存时排在**前面**（`✅ 🔴 标题`）：两者语义不同——✅ 是「有结果了，
+ * 回来看看」，🔴 是「卡着等你点」。绿色与红色在任务栏小尺寸下也容易区分。
+ */
+export const DEFAULT_DONE_MARK = '✅ ';
 
 /**
  * 默认标记：红色圆点 + 空格。
@@ -224,10 +264,25 @@ export interface AttentionDeps {
   readTitle(): { workspaceValue?: string; globalValue?: string; defaultValue?: string };
   /** 写 `window.title` 的工作区层级值；`undefined` 表示删除该键。 */
   writeTitle(value: string | undefined): Promise<void>;
-  /** 反馈当前是否处于等待态（状态栏等 UI 由调用方实现）。 */
-  onStateChange(pending: readonly PendingInteraction[]): void;
+  /** 反馈当前状态（状态栏等 UI 由调用方实现）。 */
+  onStateChange(state: AttentionState): void;
+  /**
+   * 当前窗口是否有焦点。
+   *
+   * 决定「刚跑完一轮」要不要亮标记：你正盯着屏幕看它跑完，就不需要提醒。
+   * 缺省视为**无焦点**（宁可多提醒一次，也不要漏掉真正需要提醒的场合）。
+   */
+  isWindowFocused?(): boolean;
   /** 诊断输出；缺省静默。 */
   log?(message: string): void;
+}
+
+/** 对外反馈的状态快照。 */
+export interface AttentionState {
+  /** 仍在等待人工确认的交互。 */
+  pending: readonly PendingInteraction[];
+  /** 是否有「在你不看的时候跑完了一轮」尚未被你查看。 */
+  done: boolean;
 }
 
 /**
@@ -238,7 +293,10 @@ export interface AttentionDeps {
  */
 export class AttentionWatcher {
   private readonly deps: AttentionDeps;
+  /** 待确认标记。 */
   private readonly mark: string;
+  /** 「刚跑完一轮」标记。 */
+  private readonly doneMark: string;
   /**
    * 曾经用过的标记前缀。
    *
@@ -248,18 +306,71 @@ export class AttentionWatcher {
   private readonly legacyMarks: readonly string[];
   /** 当前已知的等待项（按 toolCallId 去重后的快照）。 */
   private current: PendingInteraction[] = [];
-  /** 标题是否已被我们打上标记。 */
-  private marked = false;
+  /** 是否有「你不在看的时候跑完的一轮」尚未被查看。 */
+  private done = false;
+  /**
+   * 我们当前写进标题的前缀（可能是 `''` / `doneMark` / `mark` / 两者拼接）。
+   *
+   * 存「写了什么」而不是布尔「打没打标记」：两个标志组合出四种前缀，
+   * 用布尔无法判断「需不需要改写」，会导致 pending 消失但 done 仍在时漏改标题。
+   */
+  private currentPrefix = '';
+  /**
+   * 每个会话文件最后一个 `turn_end` 的身份。
+   *
+   * 首次扫描只**建立基线**、不触发「完成」——否则一打开窗口，历史上每个会话的
+   * 最后一轮都会被当成「刚刚跑完」，标题上立刻挂一个假的 ✅。
+   */
+  private lastTurnEnds = new Map<string, string | null>();
+  /** 基线是否已建立。 */
+  private baselined = false;
 
-  constructor(deps: AttentionDeps, mark: string, legacyMarks: readonly string[] = []) {
+  constructor(
+    deps: AttentionDeps,
+    mark: string,
+    legacyMarks: readonly string[] = [],
+    doneMark: string = DEFAULT_DONE_MARK
+  ) {
     this.deps = deps;
     this.mark = normalizeMark(mark);
-    this.legacyMarks = legacyMarks.filter((m) => m && m !== this.mark);
+    this.doneMark = normalizeMark(doneMark, DEFAULT_DONE_MARK);
+    this.legacyMarks = legacyMarks.filter(
+      (m) => m && m !== this.mark && m !== this.doneMark
+    );
+  }
+
+  /** 当前生效的全部标记（含历史标记），用于摘除时逐个尝试。 */
+  private get allMarks(): string[] {
+    return [this.mark, this.doneMark, ...this.legacyMarks];
+  }
+
+  /** 由两个标志拼出应有的标题前缀。 */
+  private desiredPrefix(): string {
+    return (this.done ? this.doneMark : '') + (this.current.length > 0 ? this.mark : '');
   }
 
   /** 当前等待项的只读快照。 */
   get pending(): readonly PendingInteraction[] {
     return this.current;
+  }
+
+  /** 是否有未查看的「已完成」。 */
+  get hasDone(): boolean {
+    return this.done;
+  }
+
+  /**
+   * 窗口获得焦点：清掉「已完成」标记。
+   *
+   * 这就是「主动点过这个窗口之后 ✅ 就消失」——你已经看到了，提醒的使命结束。
+   * 待确认标记**不受影响**：那件事还没做完。
+   */
+  async onWindowFocused(): Promise<void> {
+    if (!this.done) return;
+    this.done = false;
+    this.deps.log?.('[待确认] 窗口获得焦点，清除完成标记');
+    this.deps.onStateChange({ pending: this.current, done: false });
+    await this.syncTitle();
   }
 
   /**
@@ -269,28 +380,58 @@ export class AttentionWatcher {
    * 只是本功能在该环境下无从判断，此时也应当把可能残留的标记摘掉。
    */
   async refresh(): Promise<void> {
-    const next = this.collect();
-    const changed = !sameIds(this.current, next);
+    const { pending: next, turnEnds } = this.collect();
+
+    // 「刚跑完一轮」：任一会话的最后一个 turn_end 变了身份即算完成。
+    // 「任一完成就亮」是刻意的语义——你关心的是「有东西跑完了，回来看看」，
+    // 而不是「所有会话都停了」；后者在多会话下几乎永远等不到。
+    let finished = false;
+    if (this.baselined) {
+      for (const [file, id] of turnEnds) {
+        if (id !== null && this.lastTurnEnds.get(file) !== id) finished = true;
+      }
+    }
+    this.lastTurnEnds = turnEnds;
+    this.baselined = true;
+
+    const wasDone = this.done;
+    if (finished && !this.isFocused()) {
+      this.done = true;
+      this.deps.log?.('[待确认] 有会话跑完了一轮，且窗口无焦点 → 亮完成标记');
+    }
+
+    const pendingChanged = !sameIds(this.current, next);
     this.current = next;
-    if (changed) {
+    if (pendingChanged) {
       this.deps.log?.(
         `[待确认] ${next.length} 项` +
           (next.length > 0 ? '：' + next.map((p) => p.question || p.toolCallId).join(' / ') : '')
       );
-      this.deps.onStateChange(next);
     }
-    await this.syncTitle(next.length > 0);
+    if (pendingChanged || this.done !== wasDone) {
+      this.deps.onStateChange({ pending: next, done: this.done });
+    }
+    await this.syncTitle();
+  }
+
+  private isFocused(): boolean {
+    try {
+      return this.deps.isWindowFocused?.() ?? false;
+    } catch {
+      return false;
+    }
   }
 
   /** 摘掉标记并清空状态（扩展停用 / 功能被关闭时调用）。 */
   async dispose(): Promise<void> {
     this.current = [];
-    await this.syncTitle(false);
+    this.done = false;
+    await this.syncTitle();
   }
 
   /** 当前是否处于「已打标记」状态。调用方据此决定要不要开兜底对账。 */
   get isMarked(): boolean {
-    return this.marked;
+    return this.currentPrefix !== '';
   }
 
   /**
@@ -302,30 +443,35 @@ export class AttentionWatcher {
     const t = this.deps.readTitle();
     const ws = t.workspaceValue;
     if (typeof ws !== 'string') {
-      this.marked = false;
+      this.currentPrefix = '';
       return;
     }
-    // 当前标记与历史标记都要认：用户换过标记时，旧前缀同样得摘掉
-    const hit = [this.mark, ...this.legacyMarks].find((m) => isTitleMarked(ws, m));
+    const marks = this.allMarks;
+    // 当前两个标记与历史标记都要认：用户换过标记时，旧前缀同样得摘掉
+    const hit = marks.find((m) => isTitleMarked(ws, m));
     if (hit !== undefined) {
       this.deps.log?.(`[待确认] 清理上次遗留的标题标记（${JSON.stringify(hit)}）`);
-      const stripped = stripAnyMark(ws, [this.mark, ...this.legacyMarks]);
-      const fallback = t.globalValue ?? t.defaultValue ?? '';
+      const stripped = stripAnyMark(ws, marks);
+      const fallback = stripAnyMark(t.globalValue ?? t.defaultValue ?? '', marks);
       try {
         await this.deps.writeTitle(stripped === fallback ? undefined : stripped);
       } catch (e: unknown) {
         this.deps.log?.('[待确认] 清理遗留标记失败：' + messageOf(e));
       }
     }
-    this.marked = false;
+    this.currentPrefix = '';
   }
 
   /** 枚举工作区下每个会话的 MessagesFile 尾部，汇总等待项。 */
-  private collect(): PendingInteraction[] {
+  private collect(): {
+    pending: PendingInteraction[];
+    turnEnds: Map<string, string | null>;
+  } {
+    const turnEnds = new Map<string, string | null>();
     const dir = this.deps.sessionDir();
-    if (!dir) return [];
+    if (!dir) return { pending: [], turnEnds };
     const names = this.deps.listDir(dir);
-    if (!names) return [];
+    if (!names) return { pending: [], turnEnds };
 
     const out: PendingInteraction[] = [];
     const seen = new Set<string>();
@@ -333,13 +479,15 @@ export class AttentionWatcher {
       const file = path.join(dir, name, MESSAGES_FILENAME);
       const raw = this.deps.readTail(file, TAIL_BYTES);
       if (raw === null) continue;
-      for (const item of scanPendingInteractions(raw)) {
+      const activity = scanSessionActivity(raw);
+      turnEnds.set(file, activity.lastTurnEndId);
+      for (const item of activity.pending) {
         if (seen.has(item.toolCallId)) continue;
         seen.add(item.toolCallId);
         out.push(item);
       }
     }
-    return out;
+    return { pending: out, turnEnds };
   }
 
   /**
@@ -350,26 +498,21 @@ export class AttentionWatcher {
    * 样子；否则写回摘掉标记的值（说明用户自己在工作区层级设过标题）。
    * 这样即使跨进程重启、globalState 丢失，也不会留下一个我们凭空写出来的键。
    */
-  private async syncTitle(waiting: boolean): Promise<void> {
-    if (waiting === this.marked) return;
+  private async syncTitle(): Promise<void> {
+    const desired = this.desiredPrefix();
+    if (desired === this.currentPrefix) return;
 
     const t = this.deps.readTitle();
-    const base = t.workspaceValue ?? t.globalValue ?? t.defaultValue ?? '';
+    const marks = this.allMarks;
+    // 基线一律先把已知标记全摘掉再拼，因此「🔴 → ✅ 🔴」这类前缀变化不会叠加
+    const base = stripAnyMark(t.workspaceValue ?? t.globalValue ?? t.defaultValue ?? '', marks);
+    const fallback = stripAnyMark(t.globalValue ?? t.defaultValue ?? '', marks);
+    const target = desired + base;
 
     try {
-      if (waiting) {
-        const next = markTitle(base, this.mark);
-        if (next !== t.workspaceValue) await this.deps.writeTitle(next);
-        this.marked = true;
-      } else {
-        const stripped = stripAnyMark(t.workspaceValue ?? base, [
-          this.mark,
-          ...this.legacyMarks,
-        ]);
-        const fallback = t.globalValue ?? t.defaultValue ?? '';
-        await this.deps.writeTitle(stripped === fallback ? undefined : stripped);
-        this.marked = false;
-      }
+      // 回到「我们没来过」的样子时删掉工作区键，而不是留一个与上层同值的冗余键
+      await this.deps.writeTitle(target === fallback ? undefined : target);
+      this.currentPrefix = desired;
     } catch (e: unknown) {
       // 写配置失败（只读工作区、settings.json 被占用）不应让功能整体崩掉：
       // 状态栏那一路提示仍然有效。

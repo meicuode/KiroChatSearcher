@@ -6,6 +6,7 @@ import {
   markTitle,
   normalizeMark,
   scanPendingInteractions,
+  scanSessionActivity,
   stripAnyMark,
   unmarkTitle,
   type AttentionDeps,
@@ -135,6 +136,176 @@ describe('标题标记 - 幂等性', () => {
   });
 });
 
+describe('scanSessionActivity - 轮结束身份', () => {
+  it('取最后一个 turn_end 的事件 id', () => {
+    const raw = [
+      line({ type: 'turn_end', stopReason: 'end_turn' }, '2026-09-03T01:00:00.000Z'),
+      line({ type: 'turn_end', stopReason: 'end_turn' }, '2026-09-03T02:00:00.000Z'),
+    ]
+      .map((l, i) => l.replace('"id":"x"', `"id":"turn-${i}"`))
+      .join('\n');
+    expect(scanSessionActivity(raw).lastTurnEndId).toBe('turn-1');
+  });
+
+  it('没有 id 时退回时间戳', () => {
+    const raw = JSON.stringify({
+      timestamp: '2026-09-03T03:00:00.000Z',
+      payload: { type: 'turn_end' },
+    });
+    expect(scanSessionActivity(raw).lastTurnEndId).toBe('2026-09-03T03:00:00.000Z');
+  });
+
+  it('没有 turn_end 时为 null', () => {
+    expect(scanSessionActivity(pendingLine('t1')).lastTurnEndId).toBeNull();
+  });
+
+  it('与 pending 判定在同一次遍历里得出，互不干扰', () => {
+    const raw = [pendingLine('t1'), turnEndLine(), pendingLine('t2')].join('\n');
+    const a = scanSessionActivity(raw);
+    expect(a.pending.map((p) => p.toolCallId)).toEqual(['t2']);
+    expect(a.lastTurnEndId).not.toBeNull();
+  });
+});
+
+describe('AttentionWatcher - 完成状态（✅）', () => {
+  const DONE = '✅ ';
+
+  /** 造一个「一轮已结束」的会话文本，turn_end 带指定 id。 */
+  const withTurnEnd = (id: string) =>
+    JSON.stringify({ id, timestamp: '2026-09-03T01:00:00.000Z', payload: { type: 'turn_end' } });
+
+  it('首次扫描只建立基线，历史 turn_end 不会亮 ✅', async () => {
+    // 否则一打开窗口，每个会话的最后一轮都会被当成「刚跑完」
+    const { deps, writes } = makeDeps({ files: { 's1/messages.jsonl': withTurnEnd('old') } });
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+    expect(w.hasDone).toBe(false);
+    expect(writes).toEqual([]);
+  });
+
+  it('基线之后出现新的 turn_end 且窗口无焦点 → 亮 ✅', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': withTurnEnd('old') };
+    const { deps, writes, focus } = makeDeps({ files, title: { defaultValue: '${rootName}' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    focus.value = false;
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('fresh');
+    await w.refresh();
+    expect(w.hasDone).toBe(true);
+    expect(writes).toEqual(['✅ ${rootName}']);
+  });
+
+  it('窗口有焦点时跑完不亮 ✅（你正盯着看，不需要提醒）', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': withTurnEnd('old') };
+    const { deps, writes, focus } = makeDeps({ files });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    focus.value = true;
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('fresh');
+    await w.refresh();
+    expect(w.hasDone).toBe(false);
+    expect(writes).toEqual([]);
+  });
+
+  it('多会话「任一完成就亮」', async () => {
+    const files: Record<string, string> = {
+      's1/messages.jsonl': withTurnEnd('a1'),
+      's2/messages.jsonl': withTurnEnd('b1'),
+    };
+    const { deps } = makeDeps({ files });
+    deps.readTail = (file) => {
+      const k = Object.keys(files).find((x) => file.replace(/\\/g, '/').includes('/' + x));
+      return k === undefined ? null : files[k];
+    };
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+    expect(w.hasDone).toBe(false);
+    // 只有 s2 又跑完一轮
+    files['s2/messages.jsonl'] += '\n' + withTurnEnd('b2');
+    await w.refresh();
+    expect(w.hasDone).toBe(true);
+  });
+
+  it('聚焦窗口后 ✅ 消失，但待确认标记不受影响', async () => {
+    const files: Record<string, string> = {
+      's1/messages.jsonl': withTurnEnd('old'),
+    };
+    const { deps, writes, focus } = makeDeps({ files, title: { defaultValue: 'T' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+
+    // 又跑完一轮，同时冒出一个待确认 → 两个标记并存，✅ 在前
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('fresh') + '\n' + pendingLine('t1');
+    await w.refresh();
+    expect(writes[writes.length - 1]).toBe('✅ * T');
+    expect(w.hasDone).toBe(true);
+    expect(w.pending).toHaveLength(1);
+
+    // 聚焦：只摘 ✅，🔴/* 留着
+    focus.value = true;
+    await w.onWindowFocused();
+    expect(w.hasDone).toBe(false);
+    expect(w.pending).toHaveLength(1);
+    expect(writes[writes.length - 1]).toBe('* T');
+  });
+
+  it('从「只有待确认」变成「两者并存」时标题被改写，不会漏改', async () => {
+    // 用布尔 marked 会漏掉这种前缀变化，故用「当前写了什么前缀」比对
+    const files: Record<string, string> = { 's1/messages.jsonl': pendingLine('t1') };
+    const { deps, writes } = makeDeps({ files, title: { defaultValue: 'T' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+    expect(writes).toEqual(['* T']);
+
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('f1');
+    await w.refresh();
+    // turn_end 作废了先前的 pending，于是只剩 ✅
+    expect(writes[writes.length - 1]).toBe('✅ T');
+  });
+
+  it('未提供 isWindowFocused 时按「无焦点」处理，宁可多提醒一次', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': withTurnEnd('old') };
+    const { deps } = makeDeps({ files, title: { defaultValue: 'T' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    delete (deps as { isWindowFocused?: unknown }).isWindowFocused;
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('fresh');
+    await w.refresh();
+    expect(w.hasDone).toBe(true);
+  });
+
+  it('doneMark 同样走归一化，且与 titleMark 不会互相顶替', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': withTurnEnd('old') };
+    const { deps, writes } = makeDeps({ files, title: { defaultValue: 'T' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, '🔴', [], '🎉'); // 两个都不带空格
+    await w.refresh();
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('fresh') + '\n' + pendingLine('t1');
+    await w.refresh();
+    expect(writes[writes.length - 1]).toBe('🎉 🔴 T');
+  });
+
+  it('dispose 把 ✅ 一起摘掉', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': withTurnEnd('old') };
+    const { deps, writes } = makeDeps({ files, title: { defaultValue: 'T' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, MARK, [], DONE);
+    await w.refresh();
+    files['s1/messages.jsonl'] += '\n' + withTurnEnd('fresh');
+    await w.refresh();
+    expect(w.isMarked).toBe(true);
+    await w.dispose();
+    expect(w.hasDone).toBe(false);
+    expect(writes[writes.length - 1]).toBeUndefined();
+  });
+});
+
 describe('标记归一化与多标记摘除', () => {
   it('默认标记是彩色实心圆点 + 空格', () => {
     expect(DEFAULT_TITLE_MARK).toBe('🔴 ');
@@ -179,7 +350,8 @@ function makeDeps(opts: {
   const files = opts.files ?? {};
   const title = { ...(opts.title ?? { defaultValue: '${dirty}${activeEditorShort}' }) };
   const writes: Array<string | undefined> = [];
-  const states: PendingInteraction[][] = [];
+  const states: Array<{ pending: PendingInteraction[]; done: boolean }> = [];
+  const focus = { value: false };
   const deps: AttentionDeps = {
     sessionDir: () => '/ws',
     listDir: () => Object.keys(files).map((k) => k.split('/')[0]),
@@ -192,9 +364,10 @@ function makeDeps(opts: {
       writes.push(value);
       title.workspaceValue = value;
     },
-    onStateChange: (p) => void states.push([...p]),
+    onStateChange: (s) => void states.push({ pending: [...s.pending], done: s.done }),
+    isWindowFocused: () => focus.value,
   };
-  return { deps, writes, states, title };
+  return { deps, writes, states, title, focus };
 }
 
 describe('AttentionWatcher - 标题同步', () => {
@@ -227,7 +400,7 @@ describe('AttentionWatcher - 标题同步', () => {
     (deps as unknown as { readTail: () => string }).readTail = () => settled['s1/messages.jsonl'];
     await w.refresh();
     expect(writes).toEqual(['* ${dirty}${activeEditorShort}', undefined]);
-    expect(states[states.length - 1]).toEqual([]);
+    expect(states[states.length - 1].pending).toEqual([]);
   });
 
   it('用户自己在工作区层设过标题时，还原成他的值而不是删键', async () => {
@@ -301,7 +474,7 @@ describe('AttentionWatcher - 标题同步', () => {
     };
     const w = new AttentionWatcher(deps, MARK);
     await expect(w.refresh()).resolves.toBeUndefined();
-    expect(states[0].map((p) => p.toolCallId)).toEqual(['t1']);
+    expect(states[0].pending.map((p) => p.toolCallId)).toEqual(['t1']);
   });
 
   it('同一项目下多个会话在等 → 汇总计数，逐个确认时标记一直保留到最后一个', async () => {
@@ -342,7 +515,7 @@ describe('AttentionWatcher - 标题同步', () => {
     expect(writes).toEqual(['* ${dirty}${activeEditorShort}', undefined]);
 
     // 状态回调把每一次数量变化都报了出去（状态栏据此显示「待确认 N」）
-    expect(states.map((s) => s.length)).toEqual([3, 2, 1, 0]);
+    expect(states.map((s) => s.pending.length)).toEqual([3, 2, 1, 0]);
   });
 
   it('一个会话里同时挂着多个待确认，逐个确认同样只在清空后还原', async () => {
@@ -395,7 +568,7 @@ describe('AttentionWatcher - 标题同步', () => {
     expect(writes[writes.length - 1]).toBeUndefined();
   });
 
-  it('dispose 摘掉标记', async () => {
+  it('dispose 摘掉标记（两个标志都清）', async () => {
     const { deps, writes } = makeDeps({ files: waiting });
     const w = new AttentionWatcher(deps, MARK);
     await w.refresh();

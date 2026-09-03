@@ -29,7 +29,12 @@ import {
   type ConfirmPrompt,
 } from './storage/cleaner';
 import { buildClassifyRoots } from './storage/classify';
-import { AttentionWatcher, DEFAULT_TITLE_MARK, type AttentionDeps } from './attention';
+import {
+  AttentionWatcher,
+  DEFAULT_DONE_MARK,
+  DEFAULT_TITLE_MARK,
+  type AttentionDeps,
+} from './attention';
 import { SettingsPanel, type SettingsPanelDeps } from './settings';
 import { probeOtelGlobals, renderOtelProbe } from './telemetryTap';
 import {
@@ -261,7 +266,23 @@ async function syncTurnTimerOnActivate(context: vscode.ExtensionContext): Promis
  * 换标记时旧前缀可能还留在某个工作区的 `settings.json` 里，只认新标记会摘不掉，
  * 所以清理残留时把这些一并尝试。`* ` 是 1.4.x 的初始默认值。
  */
-const ATTENTION_LEGACY_MARKS = ['* ', '🔴 ', '🔔 ', '⚠️ ', '❗ ', '✋ ', '⏳ ', '🟠 ', '👉 '];
+const ATTENTION_LEGACY_MARKS = [
+  '* ',
+  '🔴 ',
+  '🔔 ',
+  '⚠️ ',
+  '❗ ',
+  '✋ ',
+  '⏳ ',
+  '🟠 ',
+  '👉 ',
+  // 「已完成」侧曾经内置过 / 用户可能配过的
+  '✅ ',
+  '🟢 ',
+  '☑️ ',
+  '🎉 ',
+  '🔵 ',
+];
 
 /** 文件变更后的防抖窗口：`messages.jsonl` 每个事件都会触发一次 change。 */
 const ATTENTION_DEBOUNCE_MS = 400;
@@ -377,20 +398,30 @@ function buildAttentionDeps(): AttentionDeps {
         .update('title', value, vscode.ConfigurationTarget.Workspace);
       if (value === undefined) removeEmptyWorkspaceSettings();
     },
-    onStateChange: (pending) => {
+    onStateChange: ({ pending, done }) => {
       const bar = getAttentionStatusBar();
-      if (pending.length === 0) {
+      if (pending.length === 0 && !done) {
         bar.hide();
         return;
       }
-      const first = pending[0].question || pending[0].interactionType || '等待确认';
-      bar.text =
-        pending.length > 1 ? `$(bell-dot) 待确认 ${pending.length}` : '$(bell-dot) 待确认';
-      bar.tooltip = pending.map((p) => '• ' + (p.question || p.toolCallId)).join('\n');
-      bar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-      bar.accessibilityInformation = { label: `Kiro 等待确认：${first}` };
+      if (pending.length > 0) {
+        // 待确认优先：它是「卡着等你点」，比「跑完了」更需要立刻处理
+        const first = pending[0].question || pending[0].interactionType || '等待确认';
+        bar.text =
+          pending.length > 1 ? `$(bell-dot) 待确认 ${pending.length}` : '$(bell-dot) 待确认';
+        bar.tooltip = pending.map((p) => '• ' + (p.question || p.toolCallId)).join('\n');
+        bar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        bar.accessibilityInformation = { label: `Kiro 等待确认：${first}` };
+      } else {
+        bar.text = '$(check-all) 已完成';
+        bar.tooltip = 'Kiro 在你离开期间跑完了一轮；聚焦本窗口后此提示消失';
+        // 完成是好消息，不该用警告色去抢注意力
+        bar.backgroundColor = undefined;
+        bar.accessibilityInformation = { label: 'Kiro 已完成一轮' };
+      }
       bar.show();
     },
+    isWindowFocused: () => vscode.window.state.focused,
     log: (message) => logTurnTimer(message),
   };
 }
@@ -406,10 +437,10 @@ function startAttentionWatcher(context: vscode.ExtensionContext): void {
   if (!attentionEnabled()) return;
 
   const deps = buildAttentionDeps();
-  const mark = vscode.workspace
-    .getConfiguration('kiroChatSearch')
-    .get<string>('pendingApproval.titleMark', DEFAULT_TITLE_MARK);
-  const watcher = new AttentionWatcher(deps, mark, ATTENTION_LEGACY_MARKS);
+  const cfg = vscode.workspace.getConfiguration('kiroChatSearch');
+  const mark = cfg.get<string>('pendingApproval.titleMark', DEFAULT_TITLE_MARK);
+  const doneMark = cfg.get<string>('pendingApproval.doneMark', DEFAULT_DONE_MARK);
+  const watcher = new AttentionWatcher(deps, mark, ATTENTION_LEGACY_MARKS, doneMark);
   attentionWatcher = watcher;
 
   const schedule = () => {
@@ -450,6 +481,13 @@ function startAttentionWatcher(context: vscode.ExtensionContext): void {
       attentionDisposables.push(new vscode.Disposable(() => clearInterval(poll)));
     }
   }
+
+  // 窗口获得焦点即视为「你已经看到了」，清掉完成标记（待确认标记不受影响）
+  attentionDisposables.push(
+    vscode.window.onDidChangeWindowState((state) => {
+      if (state.focused) void watcher.onWindowFocused();
+    })
+  );
 
   // 工作区变化（新增/移除文件夹）后会话目录会变，重建监听
   attentionDisposables.push(
@@ -1592,7 +1630,8 @@ export function activate(context: vscode.ExtensionContext) {
       // 否则旧前缀会留在标题上摘不掉。
       if (
         e.affectsConfiguration('kiroChatSearch.pendingApproval.enabled') ||
-        e.affectsConfiguration('kiroChatSearch.pendingApproval.titleMark')
+        e.affectsConfiguration('kiroChatSearch.pendingApproval.titleMark') ||
+        e.affectsConfiguration('kiroChatSearch.pendingApproval.doneMark')
       ) {
         startAttentionWatcher(context);
       }
