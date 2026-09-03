@@ -710,9 +710,10 @@ describe('Property 2: 当前工作区归属等于两处目录之和', () => {
       // 真实临时目录夹具 + 每轮一次整树 scanTree 属 IO 密集：并行跑全量测试套件时
       // 100 轮会逼近/超过默认 5s 用例超时。按 design 测试策略对真实 fs 夹具的放宽降到
       // 50 轮（仍覆盖建/不建两处目录、空目录、噪声排除等分支），并给出显式宽松超时。
+      // 超时取 120s 与本文件其它真实 fs 用例对齐：60s 在并行负载下实测仍会偶发撞上。
       { numRuns: 50 }
     );
-  }, 60_000);
+  }, 120_000);
 
   it('Property 2: 无工作区（workspacePath 为 null）时 currentWorkspaceBytes 恒为 0', async () => {
     base = mkTempDir('kcs-analyzer-ws-null-');
@@ -743,7 +744,7 @@ describe('Property 2: 当前工作区归属等于两处目录之和', () => {
       }),
       { numRuns: 50 }
     );
-  }, 60_000);
+  }, 120_000);
 
   it('Property 2: 工作区目录不存在时 currentWorkspaceBytes 为 0（仅噪声目录存在）', async () => {
     base = mkTempDir('kcs-analyzer-ws-absent-');

@@ -192,9 +192,13 @@ describe('Property 23: 目录聚合可加性', () => {
           await checkAdditive(roots, root, maxDepth);
         }
       ),
-      { numRuns: 100 }
+      // 真实临时目录夹具：每轮建一棵树 + 递归逐层重扫做可加性比对，属 IO 密集。
+      // 与 storage.analyzer.property 对真实 fs 夹具的放宽同一口径，取 50 轮
+      // （仍覆盖 maxDepth 0..5 的边界与随机树形），并给显式宽松超时。
+      // 不这么做的后果是实测过的：并行负载下本用例会撞上全局 testTimeout 而偶发失败。
+      { numRuns: 50 }
     );
-  });
+  }, 120_000);
 });
 
 /* ------------------------------------------------------------------ *
@@ -501,9 +505,11 @@ describe('Property 16: 扫描预算', () => {
           expect(res.cancelled).toBe(false);
         }
       ),
-      { numRuns: 100 }
+      // 真实 fs 夹具（每轮建树 + 扫描）：取 50 轮并给显式宽松超时，理由同 Property 23。
+      // 让出频率的组合覆盖由同组的内存 fs 用例（缺省 512 间隔那条）承担，不靠这里堆轮数。
+      { numRuns: 50 }
     );
-  });
+  }, 120_000);
 
   it('Property 16: 缺省让出间隔恒为 512，让出次数恒为 floor(n / 512)', async () => {
     await fc.assert(
@@ -816,9 +822,12 @@ describe('Property 18: 符号链接不被跟随', () => {
           expect(after.totalBytes).toBe(before.totalBytes);
         }
       ),
-      { numRuns: 100 }
+      // 本文件最重的真实 fs 用例：每轮建两棵树 + 建链接 + 放大目标 + **两次**全量扫描。
+      // 因此比同组其它真实 fs 用例再降一档取 30 轮（仍覆盖目录/文件链接两种、
+      // 三档放大倍数、随机树形与挂载位置），并给显式宽松超时。
+      { numRuns: 30 }
     );
-  });
+  }, 120_000);
 
   it('Property 18: 链接自身恒按其所在路径的分类计入恰好一个条目', async () => {
     base = mkTempDir('kcs-scanner-link-cat-');
@@ -870,9 +879,11 @@ describe('Property 18: 符号链接不被跟随', () => {
           expect(after.cancelled).toBe(false);
         }
       ),
-      { numRuns: 100 }
+      // 真实 fs 夹具，每轮建两棵树 + 建链接 + **两次**全量扫描：与上一条同一档，取 30 轮
+      // （仍覆盖目录/文件链接两种与随机挂载位置），并给显式宽松超时。
+      { numRuns: 30 }
     );
-  });
+  }, 120_000);
 
   it('Property 18: 循环链接（目录链接指回祖先）夹具下统计恒终止且恒不枚举链接内部', async () => {
     base = mkTempDir('kcs-scanner-link-cycle-');
@@ -906,9 +917,11 @@ describe('Property 18: 符号链接不被跟随', () => {
         expect(res.cancelled).toBe(false);
         expect(res.totalFiles).toBeGreaterThanOrEqual(1);
       }),
-      { numRuns: 100 }
+      // 真实 fs 夹具（建树 + 目录链接成环 + 扫描）：取 50 轮并给显式宽松超时，理由同上。
+      // 环的终止性另有一条注入 fs 的用例覆盖，与介质无关，不靠这里堆轮数。
+      { numRuns: 50 }
     );
-  });
+  }, 120_000);
 
   it('Property 18: 链接项自称目录且指回祖先时恒不递归其目标（注入 fs，与介质无关）', async () => {
     await fc.assert(
