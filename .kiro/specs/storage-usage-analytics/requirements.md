@@ -36,6 +36,7 @@ Kiro 把聊天历史与执行数据强制写在系统盘的用户数据目录（
 以下内容明确不在本次范围内：
 
 - **孤儿存档的批量清理**：不提供入口，仅统计与展示。理由见 Requirement 3.7——孤儿存档无法归因到排行页上的任一会话行，无法满足"只删除已枚举并展示给用户的具体文件"这一安全前提。
+- **StorageReportCommand 的纯文本报告不做超链接**：该报告写入 Kiro 输出通道（Requirement 6.8），输出通道只呈现纯文本、不支持可点击的命令链接，因此其【3】按会话排行区块的会话标题无法做成可点击项。可点击打开会话的能力只提供在 UsageRankingPage 上（Requirement 13.18–13.25）。若要在报告里也能点击，需把报告的呈现介质从输出通道改为 webview——不在本次范围内。
 - **本次不做**：递归删除目录或删除目录本身；修改 Kiro 存储位置；统计结果的持久化落盘；跨机器/云端聚合；后台定时扫描或常驻监视；删除操作的撤销与回收站。
 
 ## Glossary
@@ -72,6 +73,7 @@ Kiro 把聊天历史与执行数据强制写在系统盘的用户数据目录（
 - **UsageRankingPage**（占用排行页）: 新增的独立 webview 面板，标题「Kiro 存储占用排行」，分页展示当前项目全部会话的占用并提供逐行清理入口。
 - **RankingPageSize**: UsageRankingPage 每页展示的会话条数，固定为 50。
 - **RankingSortOrder**: UsageRankingPage 的排序方向，取值 `desc`（默认，占用由高到低）或 `asc`。
+- **SessionTitleLink**: UsageRankingPage 会话行标题列的可激活元素，激活后打开该行 sessionId 对应的会话。具备链接的外观、语义与键盘可达性，但不是可导航的超链接（sessionId 不进入任何 URL）。
 - **StorageReportCommand**: 既有命令 `kiroChatSearch.storageReport`（标题「Kiro: 存储占用分析」），输出按工作区与会话的占用排行。
 - **OpenRankingCommand**: 新增命令 `kiroChatSearch.storageRanking`（标题「Kiro: 存储占用排行」），打开 UsageRankingPage。
 - **SessionCleaner**: 本特性新增的清理模块，负责生成 CleanupPlan、执行删除、更新 SessionManifest 与输出审计记录。
@@ -308,6 +310,14 @@ Kiro 把聊天历史与执行数据强制写在系统盘的用户数据目录（
 15. WHILE UsageRankingPage 的占用统计正在进行，THE UsageRankingPage SHALL 展示「统计中…」文本、SHALL 禁用排序、翻页、刷新与清理控件、SHALL 忽略重复的统计请求并保持同时最多 1 次统计在执行，且 SHALL 保持面板可被用户关闭。
 16. WHILE 当前未打开任何工作区，THE UsageRankingPage SHALL 展示说明当前无法统计会话占用的文案、SHALL 保持表头与分页控件的结构不变并将其置为禁用态，且 THE Extension SHALL 把目录枚举排除在该状态下的行为之外。
 17. WHEN 一次清理使当前工作区可统计会话数 K 减少，THE UsageRankingPage SHALL 按更新后的 K 重新计算 N、把当前页码取为 `min(M, N)`，并按当前 RankingSortOrder 重新渲染该页与页码指示。
+18. THE UsageRankingPage SHALL 把每个会话行的标题渲染为 SessionTitleLink：SHALL 采用 Kiro 主题的链接前景色变量以适配深浅色主题、SHALL 在悬停时给出区别于普通文本的视觉反馈、SHALL 可通过键盘 Tab 聚焦并展示可见焦点样式、且 SHALL 带有链接语义与以完整会话标题构成的无障碍名称；THE SessionTitleLink SHALL 保持 Requirement 13.3 的 `(无标题)` 占位与 120 字符截断规则不变，且 WHERE 会话标题为 `(无标题)` 占位，THE SessionTitleLink SHALL 同样可被激活。
+19. WHEN 用户以鼠标点击或以 Enter、Space 键激活某行的 SessionTitleLink，THE Extension SHALL 打开该行 sessionId 对应的会话，其打开方式 SHALL 复用既有的会话跳转候选链与其失败提示（见 Requirement 5），且 THE Extension SHALL 保持 UsageRankingPage 处于打开状态、当前页码 M 与 RankingSortOrder 不变。
+20. WHEN 用户激活某行的 SessionTitleLink，THE Extension SHALL 以该行 sessionId 为准解析跳转目标，其会话标题与会话数据格式（`old` 或 `new`）SHALL 取自 Extension 自身最近一次下发给 UsageRankingPage 的会话行数据而非 UsageRankingPage 回传的值；WHERE 该 sessionId 在该数据中不存在，THE Extension SHALL 仅以 sessionId 发起跳转。
+21. WHILE UsageRankingPage 处于 `loading`、`empty`、`no-workspace` 或 `unavailable` 状态，THE UsageRankingPage SHALL 不响应 SessionTitleLink 的激活，并 SHALL 使标题呈现为不可点击的普通文本样态。
+22. WHEN 用户在 UsageRankingPage 中翻页、切换 RankingSortOrder 或刷新后激活某行的 SessionTitleLink，THE Extension SHALL 打开当前渲染的该行所对应的 sessionId 的会话。
+23. IF 一次 SessionTitleLink 跳转的全部候选命令均不可用或跳转过程抛出异常，THEN THE Extension SHALL 保持 UsageRankingPage 当前状态、页码与已渲染的行不变（即不进入 `unavailable` 状态），且 SHALL 把该次失败计入诊断输出。
+24. WHEN 用户激活某行的 SessionTitleLink，THE Extension SHALL 把目录枚举与占用重算排除在该动作之外。
+25. THE SessionTitleLink SHALL 不作为可导航的超链接实现，即 SHALL 不把 sessionId 置入任何可导航的 URL；THE UsageRankingPage SHALL 保持 Requirement 13.13 的 CSP 不被放宽，且 SHALL 把内联事件处理器排除在实现方式之外。
 
 ### Requirement 14: 会话清理
 

@@ -460,6 +460,36 @@
     - 恒 `self` 且不改搜索面板 `Σ` 状态；刷新保持排序方向；行内两个清理入口存在
     - _Requirements: 13.1, 13.4, 13.9, 13.11, 13.12, 13.13, 13.15, 13.16_
 
+- [x] 19. SessionTitleLink：排行页标题超链接打开会话（Req 13.18–13.25）
+  - [x] 19.1 `renderRankingRowHtml` 把标题渲染为链接元素
+    - `<span class="t link" role="link" tabindex="0" data-open="1" aria-label="打开会话：<完整标题>">`；不用 `<a href>`，sessionId 不进任何可导航 URL（Req 13.25）
+    - 保持既有 `(无标题)` 占位与 120 字符截断规则不变；`aria-label` 与 `title` 同样过 `escapeHtml`
+    - CSS 走主题变量：`--vscode-textLink-foreground` / `--vscode-textLink-activeForeground`，`:focus-visible` 焦点环用 `--vscode-focusBorder`；`tbody.locked` 下退回普通文本样态
+    - _Requirements: 13.3, 13.13, 13.18, 13.21, 13.25_
+
+  - [x] 19.2 注入脚本：事件委托 + 键盘激活 + 非 ok 态门禁
+    - 复用既有 tbody 事件委托：标题链接先判、命中即 return，与 `button.op` 分支互不误触；两者同受 `canInteract()` 门禁
+    - `keydown` 支持 Enter / Space（与表头排序、刷新按钮同一手法）
+    - `openFromRow` 只上报 `{ type: 'openSession', sessionId }`——标题与布局不回传（Req 13.20）
+    - `syncControls` 用 `$rows.classList.toggle('locked', !interactive)` 同步可点样态（Req 13.21）
+    - 翻页/换序后重渲染的行天然绑定正确 sessionId（委托 + `data-session-id`，Req 13.22）
+    - _Requirements: 13.19, 13.20, 13.21, 13.22, 13.24, 13.25_
+
+  - [x] 19.3 宿主接线：`RankingPanelDeps.openSession` 与 `lastRows` 反查
+    - `RankingInboundMessage` 新增 `openSession`；`RankingPanelDeps.openSession?` 可选注入（不注入则只落日志、不跳转）
+    - `RankingPanel.lastRows` 记录上一次下发给 webview 的全量行，按 sessionId 反查 `title` 与 `origin`；`origin → sessionLayout`：`legacy-unmigrated` → `'old'`，`new` / `migrated` → `'new'`（Req 13.20）
+    - 进入 `no-workspace` / `unavailable` 时清空 `lastRows`，避免拿过期行跳转
+    - `handleOpenSession` 恒不抛异常、不改面板状态，失败只写审计日志（Req 13.23）
+    - `extension.ts` 抽出共用的 `openSessionByJump()`，搜索面板的 `openSession` 一并改为复用它，避免两处各自装配 jump deps 出现偏差；`layout` 在调用时现取
+    - _Requirements: 13.19, 13.20, 13.23_
+
+  - [x] 19.4 测试
+    - `tests/storage.ranking.spec.ts` 新增一组示例测试：链接元素属性与非 `<a href>`、载荷只含 sessionId、与清理按钮互不误触且都受门禁、Enter/Space 键盘激活、非 ok 四态给 tbody 加 `locked`、主题变量与焦点环、CSP 未放宽且无内联事件处理器
+    - `runSync` 的 tbody 替身补上 `classList` 并返回 `$rows`，使 `locked` 可被断言
+    - Property 24 的标题断言随渲染结构更新，并追加"恒不出现 `<a ` 与 `href=`"
+    - 上行消息集合断言追加 `openSession`（仍为精确等值集合，`sort`/`page` 恒不出现）
+    - _Requirements: 13.18, 13.19, 13.20, 13.21, 13.22, 13.25_
+
 - [x] 17. 文档
   - [x] 17.1 更新 `README.md`
     - 描述 ComputeSizeButton、SummaryBar、SizeBadge、UsageRankingPage 与 StorageReportCommand 的用途与触发方式，并注明占用统计仅在用户显式触发时执行

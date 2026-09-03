@@ -604,9 +604,12 @@ describe('renderRankingRowHtml properties', () => {
 
         // 标题占位 / 截断（用 rankingTitleCell 作独立参照，避免与实现同构比对）
         const cell = rankingTitleCell(row.title);
+        // SessionTitleLink：标题渲染为可点击、可聚焦的链接元素，且**不是** <a href>
+        // （不引入任何可导航目标，见 renderRankingRowHtml 的注释）
+        const linkOpen = '<span class="t link" role="link" tabindex="0" data-open="1" aria-label="打开会话：';
         if (row.title.trim() === '') {
           expect(cell.text).toBe(RANKING_TITLE_PLACEHOLDER);
-          expect(html).toContain('<span class="t">' + RANKING_TITLE_PLACEHOLDER + '</span>');
+          expect(html).toContain('>' + RANKING_TITLE_PLACEHOLDER + '</span>');
         }
         if (row.title.length > RANKING_TITLE_MAX_CHARS) {
           // 前 120 字符 + 省略号（共 121 个字符），完整标题另存于 title 属性
@@ -616,9 +619,12 @@ describe('renderRankingRowHtml properties', () => {
           expect(cell.full).toBe(row.title);
           expect(html).toContain('title="' + escapeHtml(row.title) + '"');
         }
-        // 展示文本与完整标题（均已转义）恒出现
-        expect(html).toContain('<span class="t">' + escapeHtml(cell.text) + '</span>');
+        // 展示文本与完整标题（均已转义）恒出现；aria-label 用完整标题且同样转义
+        expect(html).toContain(linkOpen + escapeHtml(cell.full) + '">' + escapeHtml(cell.text) + '</span>');
         expect(html).toContain('title="' + escapeHtml(cell.full) + '"');
+        // 恒不出现可导航的锚点：sessionId 不进 href，也就没有"复制链接地址"面
+        expect(html).not.toContain('<a ');
+        expect(html).not.toContain('href=');
 
         // 最后修改时间恒形如 YYYY-MM-DD HH:mm
         const time = formatRankingTime(row.mtimeMs);

@@ -252,10 +252,11 @@ function runSync(
   const $refresh = fakeEl();
   // 每行两个清理按钮（清理存档 / 删除会话）
   const ops = Array.from({ length: renderedRowCount * 2 }, () => ({ disabled: false }));
-  const $rows = {
+  // tbody 替身也要有 classList：syncControls 用 `locked` 类控制 SessionTitleLink 的可点样态
+  const $rows = Object.assign(fakeEl(), {
     children: { length: renderedRowCount },
     querySelectorAll: (sel: string) => (sel === 'button.op' ? ops : []),
-  };
+  });
 
   const run = new Function(
     'state',
@@ -272,7 +273,7 @@ function runSync(
   );
   run(state, view, STATE_TEXT, $status, $empty, $prev, $next, $thTotal, $refresh, $rows);
 
-  return { $status, $empty, $prev, $next, $thTotal, $refresh, ops };
+  return { $status, $empty, $prev, $next, $thTotal, $refresh, ops, $rows };
 }
 
 const VIEW_EMPTY = { page: 1, totalPages: 1, total: 0 };
@@ -364,6 +365,77 @@ describe('no-workspace 态 - 结构保留置灰，连刷新都禁用（Req 13.16
   });
 });
 
+describe('SessionTitleLink - 标题超链接可点击打开对应会话', () => {
+  it('标题渲染为可聚焦的 link 元素，且不是可导航的 <a href>', () => {
+    const html = renderRankingRowHtml(
+      {
+        title: '重构存储模块',
+        sessionId: 'sess_abc',
+        jsonBytes: 1,
+        archiveBytesSelf: 2,
+        totalBytes: 3,
+        mtimeMs: 0,
+        origin: 'new',
+      } as never,
+      false
+    );
+    expect(html).toContain('class="t link"');
+    expect(html).toContain('role="link"');
+    expect(html).toContain('tabindex="0"');
+    expect(html).toContain('aria-label="打开会话：重构存储模块"');
+    // 不引入任何可导航目标：sessionId 只在 data-* 里，不进 href
+    expect(html).not.toContain('<a ');
+    expect(html).not.toContain('href=');
+    expect(html).toContain('data-session-id="sess_abc"');
+  });
+
+  it('点击链接只上报 sessionId：标题与布局由宿主自查，前端改不动', () => {
+    // 注入脚本里 openSession 消息的载荷恒只有 sessionId 一项
+    expect(SCRIPT).toContain(`vscode.postMessage({ type: 'openSession', sessionId: sessionId });`);
+    // 不回传 title / origin / layout（那三个决定调哪个跳转命令，必须以宿主的值为准）
+    const payload = SCRIPT.match(/type:\s*'openSession'[^}]*\}/)?.[0] ?? '';
+    expect(payload).not.toMatch(/title|origin|layout/);
+  });
+
+  it('链接与行内清理按钮互不误触，且都受 canInteract 门禁', () => {
+    // 标题链接先判、命中即 return，不会继续走到清理按钮分支
+    expect(SCRIPT).toContain(`closest('td.c-title .t.link')`);
+    expect(SCRIPT).toContain(`closest('button.op')`);
+    // 两个入口都在非 ok 态被拦下
+    const clickHandler = SCRIPT.slice(SCRIPT.indexOf("$rows.addEventListener('click'"));
+    expect((clickHandler.match(/canInteract\(\)/g) || []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('键盘可达：Enter / Space 激活标题链接', () => {
+    expect(SCRIPT).toContain(`$rows.addEventListener('keydown'`);
+    const keydown = SCRIPT.slice(SCRIPT.indexOf("$rows.addEventListener('keydown'"));
+    expect(keydown).toContain(`e.key !== 'Enter' && e.key !== ' '`);
+    expect(keydown).toContain('e.preventDefault()');
+    expect(keydown).toContain('openFromRow');
+  });
+
+  it('非 ok 态给 tbody 加 locked 类，使标题退回不可点样态', () => {
+    expect(runSync('ok', { page: 1, totalPages: 1, total: 2 }, 2).$rows.has('locked')).toBe(false);
+    for (const s of ['loading', 'empty', 'no-workspace', 'unavailable']) {
+      expect(runSync(s, VIEW_EMPTY, 0).$rows.has('locked'), `${s} 应锁定标题链接`).toBe(true);
+    }
+    // 对应的 CSS 兜底（JS 门禁之外，别让它看起来还能点）
+    expect(HTML).toContain('tbody.locked td.c-title .t.link');
+  });
+
+  it('链接配色与焦点环走主题变量，深浅色主题自动跟随', () => {
+    expect(HTML).toContain('--vscode-textLink-foreground');
+    expect(HTML).toContain('--vscode-textLink-activeForeground');
+    expect(HTML).toContain('td.c-title .t.link:focus-visible');
+    expect(HTML).toContain('--vscode-focusBorder');
+  });
+
+  it('跳转不放宽 CSP，也不引入内联事件处理器', () => {
+    expect(HTML).toContain(`default-src 'none'`);
+    expect(HTML).not.toMatch(/\son(click|keydown|keyup|mouseup)=/);
+  });
+});
+
 describe('ok 态 - 分页边界按 M / N 禁用（Req 13.7）', () => {
   it('M = 1 禁上一页；M = N 禁下一页；中间页两侧都可用', () => {
     const first = runSync('ok', { page: 1, totalPages: 3, total: 120 }, 50);
@@ -411,10 +483,11 @@ describe('口径 - 恒 self，不读写搜索面板的 Σ 状态（Req 13.4）',
   });
 
   // 任务 12.1 与 14.3 各新增一种上行消息：`computeAggregate`（两个重量级聚合维度的手动
-  // 触发，Req 7.5、8.2）与 `cleanupLegacyResidue`（旧残留清理入口，Req 11.1）。
+  // 触发，Req 7.5、8.2）与 `cleanupLegacyResidue`（旧残留清理入口，Req 11.1）；
+  // SessionTitleLink 又新增 `openSession`（点击标题打开该对话）。
   // 断言仍是精确等值的集合，本条要钉的性质没变：**排序与页码不回宿主**——上行集合里恒
   // 不出现 sort / page 之类的消息类型，翻页与换序全在 webview 侧完成。
-  it('上行消息恒为 ready / refresh / cleanup / computeAggregate / cleanupLegacyResidue（排序与页码不回宿主，Req 7.13）', () => {
+  it('上行消息恒为 ready / refresh / cleanup / computeAggregate / cleanupLegacyResidue / openSession（排序与页码不回宿主，Req 7.13）', () => {
     const types = [...SCRIPT.matchAll(/vscode\.postMessage\(\{\s*type:\s*'([\w-]+)'/g)].map(
       (m) => m[1]
     );
@@ -422,6 +495,7 @@ describe('口径 - 恒 self，不读写搜索面板的 Σ 状态（Req 13.4）',
       'cleanup',
       'cleanupLegacyResidue',
       'computeAggregate',
+      'openSession',
       'ready',
       'refresh',
     ]);

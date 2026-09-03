@@ -847,8 +847,15 @@ export function rankingTitleCell(title: string): {
  * （Req 13.10）：会话 JSON 字节数来自对单个文件的 `stat`，跳过其它条目不影响它的
  * 精确性，加 `≥` 反而误导。
  *
- * 所有动态文本（标题、sessionId、`data-*` 属性值）一律先过 `escapeHtml`（Req 13.13）；
- * 数值与时间由格式化函数产出，字符集恒为 `[0-9.:\-A-Z ≥]`，不含可构成标签的字符。
+ * 标题列渲染为 **SessionTitleLink**：`<span class="t link" role="link" tabindex="0" data-open="1">`。
+ * 刻意**不用** `<a href>`：本页不做任何导航，`href` 里放 sessionId 等于凭空造出一个可被
+ * 点开、可被"复制链接地址"的 URL 面；`role="link" + tabindex="0"` 拿到同样的语义与键盘可达性，
+ * 却不引入任何可导航目标。点击/回车由 tbody 上的事件委托捕获（见 `getRankingHtml` 的
+ * 注入脚本），sessionId 从 `tr` 的 `data-session-id` 读回——与行内清理入口同一取值路径，
+ * 因此翻页与换序后重渲染的行天然绑定正确的 sessionId，不需要重新绑定监听器。
+ *
+ * 所有动态文本（标题、sessionId、`data-*` 属性值、`aria-label`）一律先过 `escapeHtml`
+ * （Req 13.13）；数值与时间由格式化函数产出，字符集恒为 `[0-9.:\-A-Z ≥]`，不含可构成标签的字符。
  */
 export function renderRankingRowHtml(row: RankingRow, partial: boolean): string {
   const num = (v: unknown) => (typeof v === 'number' && isFinite(v) && v >= 0 ? v : 0);
@@ -868,7 +875,9 @@ export function renderRankingRowHtml(row: RankingRow, partial: boolean): string 
     '">' +
     '<td class="c-title" title="' +
     titleFull +
-    '"><span class="t">' +
+    '"><span class="t link" role="link" tabindex="0" data-open="1" aria-label="打开会话：' +
+    titleFull +
+    '">' +
     titleText +
     '</span></td>' +
     '<td class="c-origin"><span class="mig mig-' +
@@ -1134,6 +1143,30 @@ export function getRankingHtml(cspSource: string, nonce: string): string {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* SessionTitleLink：用主题的链接色变量，深浅色主题下自动跟随；
+     不写死颜色，也不常驻下划线（一列 50 行全带下划线会糊成一片）。 */
+  td.c-title .t.link {
+    color: var(--vscode-textLink-foreground, #3794ff);
+    cursor: pointer;
+  }
+  td.c-title .t.link:hover {
+    color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground, #3794ff));
+    text-decoration: underline;
+  }
+  /* 键盘可达：焦点环用主题变量，:focus-visible 使鼠标点击不留下焦点框 */
+  td.c-title .t.link:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+  /* 非 ok 态（loading/empty/no-workspace/unavailable）：loading 期间旧行仍在，
+     此时标题不可点，退回普通文本样态，与被 disabled 的清理按钮保持一致的观感。
+     JS 侧同样有 canInteract() 门禁，这里只负责别让它看起来还能点。 */
+  tbody.locked td.c-title .t.link {
+    color: inherit;
+    cursor: default;
+    text-decoration: none;
   }
   td.c-id code {
     font-family: var(--vscode-editor-font-family);
@@ -1405,6 +1438,10 @@ export function getRankingHtml(cspSource: string, nonce: string): string {
 
     const ops = $rows.querySelectorAll('button.op');
     for (let i = 0; i < ops.length; i++) ops[i].disabled = !interactive;
+
+    // SessionTitleLink 的可点状态：非 ok 态（尤其 loading 期间旧行仍在）退回普通文本样态。
+    // 用 tbody 上的一个 class 而不是逐行改属性：重渲染只写 innerHTML，class 不受影响。
+    $rows.classList.toggle('locked', !interactive);
   }
 
   /**
@@ -1462,10 +1499,35 @@ export function getRankingHtml(cspSource: string, nonce: string): string {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); requestRefresh(); }
   });
 
-  // 行内清理入口：事件委托到 tbody，避免每次重渲染重新绑定 100 个监听器。
+  /**
+   * SessionTitleLink 的激活：发一条 openSession 意图给宿主。
+   *
+   * 只回传 sessionId —— 标题与布局由宿主从**它自己刚下发的那批行**里按 sessionId 反查
+   * （与搜索面板的 open 协议同一取舍）：前端改不动这两个值，跳转命令的选择因此不受
+   * webview 侧数据影响。宿主拿不到该行时退化为只带 sessionId 跳转。
+   *
+   * 不在这里做任何文件系统或统计动作：跳转是纯命令调用，不触发枚举，也不改本页状态
+   * （面板保持打开，与搜索面板跳转后不关闭的既有约定一致）。
+   */
+  function openFromRow(tr) {
+    if (!tr) return;
+    const sessionId = tr.dataset.sessionId || '';
+    if (!sessionId) return;
+    vscode.postMessage({ type: 'openSession', sessionId: sessionId });
+  }
+
+  // 行内交互：事件委托到 tbody，避免每次重渲染重新绑定上百个监听器。
   // sessionId 与完整标题从 tr 的 data-* 读回（写入时已转义，dataset 读出的是原文）。
   $rows.addEventListener('click', (e) => {
-    const btn = e.target && e.target.closest ? e.target.closest('button.op') : null;
+    const t = e.target;
+    // 标题链接先判：它与清理按钮同处一行，但两者的 closest 目标互不重叠，不会互相误触
+    const link = t && t.closest ? t.closest('td.c-title .t.link') : null;
+    if (link) {
+      if (!canInteract()) return;
+      openFromRow(link.closest('tr'));
+      return;
+    }
+    const btn = t && t.closest ? t.closest('button.op') : null;
     if (!btn || btn.disabled || !canInteract()) return;
     const tr = btn.closest('tr');
     if (!tr) return;
@@ -1475,6 +1537,16 @@ export function getRankingHtml(cspSource: string, nonce: string): string {
       sessionId: tr.dataset.sessionId || '',
       title: tr.dataset.title || ''
     });
+  });
+
+  // 键盘激活标题链接：Enter / Space（与表头排序、刷新按钮同一手法）
+  $rows.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const t = e.target;
+    const link = t && t.closest ? t.closest('td.c-title .t.link') : null;
+    if (!link || !canInteract()) return;
+    e.preventDefault();
+    openFromRow(link.closest('tr'));
   });
 
   window.addEventListener('message', (e) => {
@@ -1616,6 +1688,25 @@ export interface RankingPanelDeps {
   cleaner: {
     run(mode: RankingCleanupMode, sessionId: string, title: string): Promise<unknown>;
   };
+  /**
+   * 打开一条会话（SessionTitleLink 被点击 / 回车激活时调用）。
+   *
+   * **可选**：不注入时点击标题只写一行日志、不发生跳转，既有只装配取数与清理的调用方
+   * 与测试因此不受影响。
+   *
+   * 由 extension.ts 装配为 `jump.ts` 的候选链（1.x 的 `viewSession` → `sessions.switch`，
+   * `old-only` 布局下再追加 0.9x 三项）。本面板刻意只交出 sessionId 与从自己下发的行里
+   * 反查到的 `title` / `sessionLayout`：候选链的选择与"命令全不可用"的报错都归 jump 一侧，
+   * 排行页不重复实现一套跳转，也不自行弹任何通知。
+   *
+   * 契约：**恒不抛异常**（跳转失败由 jump 内部通知用户），因此本面板不会因一次跳转失败
+   * 进入错误态；返回的 `invoked` 仅用于写审计日志。
+   */
+  openSession?(target: {
+    sessionId: string;
+    title?: string;
+    sessionLayout?: 'old' | 'new';
+  }): Promise<{ invoked: boolean }> | void;
   /** 当前工作区 fsPath；`null` 表示未打开工作区（进入 no-workspace 态，绝不枚举目录）。 */
   workspacePath: string | null;
   /**
@@ -1636,7 +1727,8 @@ type RankingInboundMessage =
   | { type: 'refresh' }
   | { type: 'computeAggregate'; kind?: unknown }
   | { type: 'cleanupLegacyResidue' }
-  | { type: 'cleanup'; mode?: unknown; sessionId?: unknown; title?: unknown };
+  | { type: 'cleanup'; mode?: unknown; sessionId?: unknown; title?: unknown }
+  | { type: 'openSession'; sessionId?: unknown };
 
 /**
  * 排行页面板：**窗口内单例**（模块级 `currentRankingPanel`）。
@@ -1682,6 +1774,16 @@ export class RankingPanel {
   private aggregateInflight: Record<string, boolean> = {};
   /** 面板已销毁：异步取数回来后据此丢弃迟到的 postMessage，避免向死 webview 发消息。 */
   private disposed = false;
+  /**
+   * 上一次下发给 webview 的**全量**行，供 SessionTitleLink 按 sessionId 反查
+   * `title` / `origin`（→ `sessionLayout`）。
+   *
+   * 只作跳转参数的查表用，不参与渲染也不参与统计：渲染用的那份数据存活在 webview 侧。
+   * 之所以在宿主留一份，是为了不采信 webview 回传的标题与布局——那两个值决定调哪个
+   * 跳转命令，必须以宿主自己刚算出的为准。进入 `no-workspace` / `unavailable` 时清空，
+   * 避免拿过期的行去跳一个可能已不存在的会话。
+   */
+  private lastRows: RankingRow[] = [];
 
   private constructor(panel: vscode.WebviewPanel, deps: RankingPanelDeps) {
     this.panel = panel;
@@ -1776,12 +1878,59 @@ export class RankingPanel {
       void this.handleLegacyResidueCleanup();
       return;
     }
+    if (msg.type === 'openSession') {
+      const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : '';
+      if (!sessionId) return;
+      void this.handleOpenSession(sessionId);
+      return;
+    }
     if (msg.type === 'cleanup') {
       const mode: RankingCleanupMode = msg.mode === 'full' ? 'full' : 'attachment';
       const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : '';
       const title = typeof msg.title === 'string' ? msg.title : '';
       if (!sessionId) return;
       void this.handleCleanup(mode, sessionId, title);
+    }
+  }
+
+  /**
+   * SessionTitleLink 的宿主侧执行体（点击标题打开对应对话）。
+   *
+   * `title` 与 `sessionLayout` 从 `lastRows`（本面板上一次下发给 webview 的那批行）按
+   * sessionId 反查，而不是采信 webview 回传的值——与 SearchSession.openSession 同一取舍。
+   * `origin` → `sessionLayout` 的映射：`legacy-unmigrated` 的数据只在 0.9x 旧目录里，
+   * 故为 `'old'`；`new` / `migrated` 均以 1.x 目录为准，故为 `'new'`。查不到该行时
+   * 只传 sessionId，候选链不变、仅省掉标题参数。
+   *
+   * 全程不触发统计、不改本页状态：跳转是纯命令调用，面板保持打开、当前页与排序不变。
+   * `openSession` 未注入或内部失败都只落一行日志——跳转失败的用户可见提示归 jump 一侧，
+   * 本面板不因此进入错误态（避免"点错一个标题把整页打成不可用"）。
+   */
+  private async handleOpenSession(sessionId: string): Promise<void> {
+    const row = this.lastRows.find((r) => r?.sessionId === sessionId);
+    const target: { sessionId: string; title?: string; sessionLayout?: 'old' | 'new' } = {
+      sessionId,
+    };
+    if (row) {
+      if (typeof row.title === 'string' && row.title.trim() !== '') target.title = row.title;
+      if (row.origin === 'legacy-unmigrated') target.sessionLayout = 'old';
+      else if (row.origin === 'new' || row.origin === 'migrated') target.sessionLayout = 'new';
+    }
+
+    const open = this.deps.openSession;
+    if (!open) {
+      this.deps.log?.('[排行页] 未装配会话跳转依赖，忽略打开请求：' + sessionId);
+      return;
+    }
+    try {
+      const res = await open(target);
+      if (res && res.invoked === false) {
+        this.deps.log?.('[排行页] 打开会话未成功：' + sessionId);
+      }
+    } catch (e: unknown) {
+      // jump 一侧已负责用户可见提示；这里只留痕，且不让本页状态受影响
+      const message = (e as { message?: string } | undefined)?.message ?? String(e);
+      this.deps.log?.('[排行页] 打开会话异常：' + sessionId + ' — ' + message);
     }
   }
 
@@ -1798,6 +1947,8 @@ export class RankingPanel {
 
     // no-workspace：不触发任何枚举，也不占用 inflight（它本就没在统计）
     if (this.deps.workspacePath === null) {
+      // 没有可展示的行，跳转查表也该跟着空掉（否则会拿上一个工作区的行去跳转）
+      this.lastRows = [];
       this.post({ type: 'state', state: 'no-workspace' });
       return;
     }
@@ -1818,9 +1969,12 @@ export class RankingPanel {
       };
       // ProjectSessionTotal 与行数据同源（Req 7.3），故搭同一条消息下发
       if (res.project) payload.project = res.project;
+      // 与下发给 webview 的恒是同一批行：SessionTitleLink 的 title / sessionLayout 由此反查
+      this.lastRows = Array.isArray(res.rows) ? res.rows : [];
       this.post(payload);
     } catch (err) {
       if (this.disposed) return;
+      this.lastRows = [];
       this.log('排行页取数失败：' + errMessage(err));
       this.post({ type: 'state', state: 'unavailable' });
     } finally {
