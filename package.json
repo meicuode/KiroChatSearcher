@@ -2,7 +2,7 @@
   "name": "kiro-chat-search",
   "displayName": "Kiro Chat Search",
   "description": "搜索 Kiro 当前项目的对话历史，点击可直接跳转到对应会话",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -56,6 +56,10 @@
         "command": "kiroChatSearch.settings",
         "title": "Kiro: 对话搜索设置",
         "icon": "$(gear)"
+      },
+      {
+        "command": "kiroChatSearch.telemetryProbe",
+        "title": "Kiro: 遥测旁听可行性探查（诊断）"
       }
     ],
     "menus": {

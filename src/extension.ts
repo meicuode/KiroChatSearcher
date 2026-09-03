@@ -31,6 +31,7 @@ import {
 import { buildClassifyRoots } from './storage/classify';
 import { AttentionWatcher, type AttentionDeps } from './attention';
 import { SettingsPanel, type SettingsPanelDeps } from './settings';
+import { probeOtelGlobals, renderOtelProbe } from './telemetryTap';
 import {
   applyTurnTimer,
   detectTurnTimer,
@@ -1511,6 +1512,17 @@ export function activate(context: vscode.ExtensionContext) {
   // 也是搜索面板过滤条右下角齿轮的落点（`openSettings` 消息执行的就是本命令）。
   context.subscriptions.push(
     vscode.commands.registerCommand('kiroChatSearch.settings', () => openSettingsPanel(context))
+  );
+
+  // 诊断命令：只读探查能否旁听 kiro-agent 的遥测（用于取真实 token 数）。
+  // 不修改任何东西，只把事实打进输出面板。
+  context.subscriptions.push(
+    vscode.commands.registerCommand('kiroChatSearch.telemetryProbe', () => {
+      const channel = getExtensionOutputChannel();
+      for (const line of renderOtelProbe(probeOtelGlobals())) channel.appendLine(line);
+      channel.appendLine('');
+      channel.show(true);
+    })
   );
 
   context.subscriptions.push(
