@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { normalizeMark } from './webview/marks';
 
 /**
  * PendingApproval：Kiro 在等你人工确认时，把标记打到**窗口标题**上。
@@ -206,18 +207,10 @@ export function stripAnyMark(title: string, marks: readonly string[]): string {
   return out;
 }
 
-/**
- * 归一化用户配置的标记。
- *
- * - 空 / 纯空白 → 退回默认，避免「配了个空串」导致标题看不出任何区别却仍在改配置
- * - 结尾没有空白就补一个：否则会渲染成 `🔴Kiro Chat Search`，emoji 和文字黏在一起
- *   （用户配的时候很容易忘掉那个空格）
- */
-export function normalizeMark(mark: string, fallback: string = DEFAULT_TITLE_MARK): string {
-  const raw = typeof mark === 'string' ? mark : '';
-  if (!raw.trim()) return fallback;
-  return /\s$/.test(raw) ? raw : raw + ' ';
-}
+// 归一化规则的实现在 `webview/marks.ts`：设置页要在浏览器侧用同一份规则算实时预览
+// （靠 `fn.toString()` 注入），而注入的函数体不能引用本模块的导出常量。这里只做转发，
+// 让「标记怎么算」在整个扩展里仍然只有一处定义。
+export { normalizeMark };
 
 /**
  * 「刚跑完一轮」的默认标记：白底对勾 + 空格。

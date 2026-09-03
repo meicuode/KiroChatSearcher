@@ -526,9 +526,43 @@ function openSettingsPanel(context: vscode.ExtensionContext): void {
     reloadWindow: async () => {
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
     },
+    getMarks: () => {
+      const cfg = vscode.workspace.getConfiguration('kiroChatSearch');
+      return {
+        enabled: cfg.get<boolean>('pendingApproval.enabled', true),
+        titleMark: cfg.get<string>('pendingApproval.titleMark', DEFAULT_TITLE_MARK),
+        doneMark: cfg.get<string>('pendingApproval.doneMark', DEFAULT_DONE_MARK),
+      };
+    },
+    setMarks: async (patch) => {
+      if (patch.enabled !== undefined) await updateMarkSetting('enabled', patch.enabled);
+      if (patch.titleMark !== undefined) await updateMarkSetting('titleMark', patch.titleMark);
+      if (patch.doneMark !== undefined) await updateMarkSetting('doneMark', patch.doneMark);
+    },
     log: (message: string) => logTurnTimer(message),
   };
   SettingsPanel.showOrCreate(context, deps);
+}
+
+/**
+ * 写一项提醒标记配置。
+ *
+ * 默认写 **Global**：标记是「我喜欢用哪个 emoji」这类个人偏好，不该跟着某个项目走
+ * （写进标题的动作才是工作区作用域的——那是为了多开时分得清窗口）。
+ *
+ * 但如果这一项在工作区层级已经有值，就**再写一份工作区值**：否则工作区值会盖住刚写下的
+ * 全局值，用户在设置页里改完看不到任何变化，只会觉得这个界面坏了。
+ */
+async function updateMarkSetting(
+  key: 'enabled' | 'titleMark' | 'doneMark',
+  value: boolean | string
+): Promise<void> {
+  const full = 'pendingApproval.' + key;
+  const cfg = vscode.workspace.getConfiguration('kiroChatSearch');
+  await cfg.update(full, value, vscode.ConfigurationTarget.Global);
+  if (cfg.inspect(full)?.workspaceValue !== undefined) {
+    await cfg.update(full, value, vscode.ConfigurationTarget.Workspace);
+  }
 }
 
 /**
@@ -1634,6 +1668,9 @@ export function activate(context: vscode.ExtensionContext) {
         e.affectsConfiguration('kiroChatSearch.pendingApproval.doneMark')
       ) {
         startAttentionWatcher(context);
+        // 设置页若开着，让它跟上：改动可能来自原生设置界面、别的窗口，
+        // 或就是设置页自己（这一次同时充当保存回执）。
+        SettingsPanel.refreshIfOpen();
       }
     })
   );

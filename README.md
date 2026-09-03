@@ -21,7 +21,7 @@
 - 命中关键词高亮显示、上下键选择、Enter 跳转、Esc 关闭、120ms 输入防抖
 - 存储占用统计：分类构成、单个会话占用、孤儿执行存档合计，全部**只在用户显式触发时**才扫描磁盘
 - 占用排行页：按占用高低分页展示当前项目全部会话，标题可点击直接打开该对话，并提供逐会话的附件清理 / 全量清理入口
-- 设置页（过滤条右下角齿轮）：开关「在对话过程中显示耗时」，并能检测该设置**实际是否生效**、一键重试与重载窗口
+- 设置页（过滤条右下角齿轮）：开关「在对话过程中显示耗时」并检测该设置**实际是否生效**（一键重试 / 重载窗口）；另一节可直接换两个提醒 emoji 并实时预览窗口标题；页头显示当前扩展版本号
 - 待确认提醒：Kiro 等你批准工具调用时，在**窗口标题**前加 🔴（任务栏/Alt+Tab 可见，标记可配）并在状态栏提示，多开时一眼看出是哪个窗口卡着
 - 完成提醒：你离开期间任一会话跑完一轮，标题前加 ✅，聚焦该窗口后消失；与 🔴 可并存，两个 emoji 都可在设置里换
 - 完整的环境校验和友好的中文错误提示
@@ -328,6 +328,15 @@ Kiro 需要批准某个工具调用时会推一条 IDE 内通知，但那条通�
 配置：`kiroChatSearch.pendingApproval.enabled`（默认 `true`）、
 `kiroChatSearch.pendingApproval.titleMark`（默认 `"🔴 "`）、
 `kiroChatSearch.pendingApproval.doneMark`（默认 `"✅ "`）。
+
+两个 emoji 也可以在**设置页**的「提醒标记」一节改（不必去原生设置界面翻 JSON）：一排候选
+按钮点一下即用，输入框也能直接填任意字符，下面实时给出**窗口标题预览**——预览拼出来的
+就是真的会被写进 `window.title` 的那个串（`markPreview` 与 `AttentionWatcher` 共用同一
+份归一化规则，`tests/settings.marks.spec.ts` 有一条对账断言钉住这一点）。改完立即生效，
+不用重载窗口。
+
+标记写 **Global** 作用域（「我喜欢用哪个 emoji」是个人偏好，不跟着项目走）；若该项在工作区
+层级已有值，则**同时**写一份工作区值，否则工作区值会盖住刚写下的全局值、看起来像界面坏了。
 
 ### 完成提醒的三个判定细节
 
@@ -687,6 +696,7 @@ src/
   settings.ts         # 设置页：HTML（纯函数）+ 面板生命周期，注入宿主能力便于测试
   attention.ts        # PendingApproval：解析待确认事件 + 窗口标题标记（不 import vscode）
   webview/turnTimer.ts # 设置页状态行文案的纯函数（turnTimerStatusLabel）
+  webview/marks.ts    # 提醒标记的归一化与标题预览（normalizeMark / markPreview，宿主与设置页共用）
 media/
   kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）
   telemetryTap.ts     # 只读诊断：进程边界与 OTel 全局注册表探查（取真实 token 的可行性）
