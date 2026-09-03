@@ -29,7 +29,7 @@ import {
   type ConfirmPrompt,
 } from './storage/cleaner';
 import { buildClassifyRoots } from './storage/classify';
-import { AttentionWatcher, type AttentionDeps } from './attention';
+import { AttentionWatcher, DEFAULT_TITLE_MARK, type AttentionDeps } from './attention';
 import { SettingsPanel, type SettingsPanelDeps } from './settings';
 import { probeOtelGlobals, renderOtelProbe } from './telemetryTap';
 import {
@@ -255,8 +255,13 @@ async function syncTurnTimerOnActivate(context: vscode.ExtensionContext): Promis
 // 真实的 fs / vscode 配置 / 状态栏接上去，并管好文件监听的防抖。
 // ---------------------------------------------------------------------------
 
-/** 等待确认时加在 `window.title` 前面的标记。 */
-const ATTENTION_MARK = '* ';
+/**
+ * 曾经内置过、或用户可能配过的标记前缀。
+ *
+ * 换标记时旧前缀可能还留在某个工作区的 `settings.json` 里，只认新标记会摘不掉，
+ * 所以清理残留时把这些一并尝试。`* ` 是 1.4.x 的初始默认值。
+ */
+const ATTENTION_LEGACY_MARKS = ['* ', '🔴 ', '🔔 ', '⚠️ ', '❗ ', '✋ ', '⏳ ', '🟠 ', '👉 '];
 
 /** 文件变更后的防抖窗口：`messages.jsonl` 每个事件都会触发一次 change。 */
 const ATTENTION_DEBOUNCE_MS = 400;
@@ -401,7 +406,10 @@ function startAttentionWatcher(context: vscode.ExtensionContext): void {
   if (!attentionEnabled()) return;
 
   const deps = buildAttentionDeps();
-  const watcher = new AttentionWatcher(deps, ATTENTION_MARK);
+  const mark = vscode.workspace
+    .getConfiguration('kiroChatSearch')
+    .get<string>('pendingApproval.titleMark', DEFAULT_TITLE_MARK);
+  const watcher = new AttentionWatcher(deps, mark, ATTENTION_LEGACY_MARKS);
   attentionWatcher = watcher;
 
   const schedule = () => {
@@ -1580,7 +1588,12 @@ export function activate(context: vscode.ExtensionContext) {
   startAttentionWatcher(context);
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('kiroChatSearch.pendingApproval.enabled')) {
+      // 改标记也要重建：stopAttentionWatcher 会先用**旧**标记还原，再按新标记重来，
+      // 否则旧前缀会留在标题上摘不掉。
+      if (
+        e.affectsConfiguration('kiroChatSearch.pendingApproval.enabled') ||
+        e.affectsConfiguration('kiroChatSearch.pendingApproval.titleMark')
+      ) {
         startAttentionWatcher(context);
       }
     })

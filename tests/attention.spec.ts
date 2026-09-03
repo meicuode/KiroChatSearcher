@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   AttentionWatcher,
+  DEFAULT_TITLE_MARK,
   isTitleMarked,
   markTitle,
+  normalizeMark,
   scanPendingInteractions,
+  stripAnyMark,
   unmarkTitle,
   type AttentionDeps,
   type PendingInteraction,
@@ -132,6 +135,42 @@ describe('标题标记 - 幂等性', () => {
   });
 });
 
+describe('标记归一化与多标记摘除', () => {
+  it('默认标记是彩色实心圆点 + 空格', () => {
+    expect(DEFAULT_TITLE_MARK).toBe('🔴 ');
+  });
+
+  it('结尾缺空格自动补上（否则 emoji 会和标题黏在一起）', () => {
+    expect(normalizeMark('🔴')).toBe('🔴 ');
+    expect(normalizeMark('🔴 ')).toBe('🔴 ');
+    expect(normalizeMark('[等待]')).toBe('[等待] ');
+    // 已有其它空白（如制表符）也算，不重复补
+    expect(normalizeMark('🔔\t')).toBe('🔔\t');
+  });
+
+  it('空 / 纯空白退回默认', () => {
+    expect(normalizeMark('')).toBe(DEFAULT_TITLE_MARK);
+    expect(normalizeMark('   ')).toBe(DEFAULT_TITLE_MARK);
+    expect(normalizeMark(undefined as unknown as string)).toBe(DEFAULT_TITLE_MARK);
+  });
+
+  it('emoji 标记的 mark/unmark 与纯文本一致（代理对不被切坏）', () => {
+    const t = markTitle('${rootName}', '🔴 ');
+    expect(t).toBe('🔴 ${rootName}');
+    expect(markTitle(t, '🔴 ')).toBe(t);
+    expect(unmarkTitle(t, '🔴 ')).toBe('${rootName}');
+    expect(isTitleMarked(t, '🔴 ')).toBe(true);
+    expect(isTitleMarked(t, '🔔 ')).toBe(false);
+  });
+
+  it('stripAnyMark 能摘掉换过标记后混叠的多种前缀', () => {
+    expect(stripAnyMark('🔴 * a', ['🔴 ', '* '])).toBe('a');
+    expect(stripAnyMark('* 🔴 a', ['🔴 ', '* '])).toBe('a');
+    expect(stripAnyMark('a', ['🔴 ', '* '])).toBe('a');
+    expect(stripAnyMark('🔴 a', ['', '🔴 '])).toBe('a'); // 空标记不参与、不死循环
+  });
+});
+
 /** 可编程的依赖替身：记录标题写入序列，供断言还原终态。 */
 function makeDeps(opts: {
   files?: Record<string, string>;
@@ -213,6 +252,29 @@ describe('AttentionWatcher - 标题同步', () => {
     await w.clearStaleMark();
     // 摘掉后与 default 相同 → 删键
     expect(writes).toEqual([undefined]);
+  });
+
+  it('用户换过标记时，clearStaleMark 能摘掉旧标记留下的前缀', async () => {
+    // 1.4.x 用的是 '* '，改成 '🔴 ' 后旧前缀仍留在某个工作区的 settings.json 里
+    const { deps, writes } = makeDeps({
+      files: settled,
+      title: { workspaceValue: '* ${rootName}', defaultValue: '${rootName}' },
+    });
+    const w = new AttentionWatcher(deps, '🔴 ', ['* ']);
+    await w.clearStaleMark();
+    expect(writes).toEqual([undefined]); // 摘掉后与 default 相同 → 删键
+  });
+
+  it('emoji 标记走完整的打上 → 还原流程', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': pendingLine('t1') };
+    const { deps, writes } = makeDeps({ files, title: { defaultValue: '${rootName}' } });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, '🔴', ['* ']); // 故意不带空格，验证归一化
+    await w.refresh();
+    expect(writes[0]).toBe('🔴 ${rootName}');
+    files['s1/messages.jsonl'] += '\n' + resolvedLine('t1');
+    await w.refresh();
+    expect(writes[1]).toBeUndefined();
   });
 
   it('clearStaleMark 在没有残留时什么都不做', async () => {

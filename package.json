@@ -2,7 +2,7 @@
   "name": "kiro-chat-search",
   "displayName": "Kiro Chat Search",
   "description": "搜索 Kiro 当前项目的对话历史，点击可直接跳转到对应会话",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -77,7 +77,12 @@
         "kiroChatSearch.pendingApproval.enabled": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Kiro 等待人工确认（批准工具调用）时，在**窗口标题**前加上 `* ` 标记，并在状态栏显示提示。\n\n标记写入**工作区**作用域的 `window.title`（多开时才能分辨是哪个窗口在等），因此等待期间 `.vscode/settings.json`（或 `.code-workspace`）会出现一处临时改动，确认后自动还原。"
+          "markdownDescription": "Kiro 等待人工确认（批准工具调用）时，在**窗口标题**前加上标记，并在状态栏显示提示。\n\n标记写入**工作区**作用域的 `window.title`（多开时才能分辨是哪个窗口在等），因此等待期间 `.vscode/settings.json`（或 `.code-workspace`）会出现一处临时改动，确认后自动还原；若该文件因此只剩空对象，会连空目录一并删除。"
+        },
+        "kiroChatSearch.pendingApproval.titleMark": {
+          "type": "string",
+          "default": "🔴 ",
+          "markdownDescription": "等待确认时加在窗口标题最前面的标记。实测 Windows 窗口标题按 UTF-16 原样保留 emoji，可以直接用彩色 emoji。\n\n任务栏按钮上的可视尺寸只有十几像素，**纯色块比线条图形好认**——有内部结构的图形在这个尺寸下会糊成一团。推荐顺序：\n\n| 标记 | 说明 |\n| --- | --- |\n| `🔴 ` | 默认。实心红点，小尺寸下最醒目，语义就是「要你处理」 |\n| `🟠 ` | 同样是纯色块，但不那么刺眼 |\n| `❗ ` | 红色且窄，标题很长时省空间 |\n| `🔔 ` | 语义最贴「通知」，但小尺寸下细节会糊 |\n| `✋ ` `⏳ ` | 偏「等待」语气 |\n| `⚠️ ` | 带变体选择符，个别字体下会渲染成单色 |\n| `* ` | 纯文本，最保守 |\n\n结尾没有空格会自动补一个（否则会和标题黏在一起）。留空则退回默认值。"
         }
       }
     },

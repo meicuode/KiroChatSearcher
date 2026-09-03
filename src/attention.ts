@@ -158,6 +158,45 @@ export function isTitleMarked(title: string, mark: string): boolean {
   return !!mark && title.startsWith(mark);
 }
 
+/** 依次摘掉任意一个候选标记（当前标记 + 历史标记），直到都不匹配。 */
+export function stripAnyMark(title: string, marks: readonly string[]): string {
+  let out = title;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const m of marks) {
+      if (m && out.startsWith(m)) {
+        out = out.slice(m.length);
+        changed = true;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 归一化用户配置的标记。
+ *
+ * - 空 / 纯空白 → 退回默认，避免「配了个空串」导致标题看不出任何区别却仍在改配置
+ * - 结尾没有空白就补一个：否则会渲染成 `🔴Kiro Chat Search`，emoji 和文字黏在一起
+ *   （用户配的时候很容易忘掉那个空格）
+ */
+export function normalizeMark(mark: string): string {
+  const raw = typeof mark === 'string' ? mark : '';
+  if (!raw.trim()) return DEFAULT_TITLE_MARK;
+  return /\s$/.test(raw) ? raw : raw + ' ';
+}
+
+/**
+ * 默认标记：红色圆点 + 空格。
+ *
+ * 选它的理由：任务栏按钮上的可视尺寸只有十几像素，此时**纯色块比线条图形好认得多**
+ * ——🔔 / ⚠️ 这类有内部结构的图形在这个尺寸下会糊成一团，而实心圆点的颜色一眼可辨。
+ * 红色又是「需要我处理」的通用语义。实测 Windows 窗口标题按 UTF-16 原样保留 emoji，
+ * 🔴 / 🔔 / ✋ / ❗ / ⏳ / ⚠️ / 🟠 / 👉 写入读回完全一致。
+ */
+export const DEFAULT_TITLE_MARK = '🔴 ';
+
 /* ------------------------------------------------------------------ *
  * 3. 状态机（注入依赖，不碰 vscode）
  * ------------------------------------------------------------------ */
@@ -200,14 +239,22 @@ export interface AttentionDeps {
 export class AttentionWatcher {
   private readonly deps: AttentionDeps;
   private readonly mark: string;
+  /**
+   * 曾经用过的标记前缀。
+   *
+   * 用户改了标记（比如从 `* ` 换成 `🔴 `）而上一次的标记还留在配置里时，
+   * 只认新标记会摘不掉旧的。清理残留时把这些一并尝试。
+   */
+  private readonly legacyMarks: readonly string[];
   /** 当前已知的等待项（按 toolCallId 去重后的快照）。 */
   private current: PendingInteraction[] = [];
   /** 标题是否已被我们打上标记。 */
   private marked = false;
 
-  constructor(deps: AttentionDeps, mark: string) {
+  constructor(deps: AttentionDeps, mark: string, legacyMarks: readonly string[] = []) {
     this.deps = deps;
-    this.mark = mark;
+    this.mark = normalizeMark(mark);
+    this.legacyMarks = legacyMarks.filter((m) => m && m !== this.mark);
   }
 
   /** 当前等待项的只读快照。 */
@@ -254,10 +301,21 @@ export class AttentionWatcher {
   async clearStaleMark(): Promise<void> {
     const t = this.deps.readTitle();
     const ws = t.workspaceValue;
-    if (typeof ws === 'string' && isTitleMarked(ws, this.mark)) {
-      this.deps.log?.('[待确认] 清理上次遗留的标题标记');
-      this.marked = true; // 让 syncTitle 走「还原」分支
-      await this.syncTitle(false);
+    if (typeof ws !== 'string') {
+      this.marked = false;
+      return;
+    }
+    // 当前标记与历史标记都要认：用户换过标记时，旧前缀同样得摘掉
+    const hit = [this.mark, ...this.legacyMarks].find((m) => isTitleMarked(ws, m));
+    if (hit !== undefined) {
+      this.deps.log?.(`[待确认] 清理上次遗留的标题标记（${JSON.stringify(hit)}）`);
+      const stripped = stripAnyMark(ws, [this.mark, ...this.legacyMarks]);
+      const fallback = t.globalValue ?? t.defaultValue ?? '';
+      try {
+        await this.deps.writeTitle(stripped === fallback ? undefined : stripped);
+      } catch (e: unknown) {
+        this.deps.log?.('[待确认] 清理遗留标记失败：' + messageOf(e));
+      }
     }
     this.marked = false;
   }
@@ -304,7 +362,10 @@ export class AttentionWatcher {
         if (next !== t.workspaceValue) await this.deps.writeTitle(next);
         this.marked = true;
       } else {
-        const stripped = unmarkTitle(t.workspaceValue ?? base, this.mark);
+        const stripped = stripAnyMark(t.workspaceValue ?? base, [
+          this.mark,
+          ...this.legacyMarks,
+        ]);
         const fallback = t.globalValue ?? t.defaultValue ?? '';
         await this.deps.writeTitle(stripped === fallback ? undefined : stripped);
         this.marked = false;
