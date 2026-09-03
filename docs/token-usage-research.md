@@ -16,11 +16,32 @@
 | C. `KIRO_CHAT_LOG_FILE` | ✅ | ✅ | 每轮把**完整上下文**写盘（实测单请求 284KB） |
 | D. `KIRO_DUMP_REQUESTS` | ✅ | ✅ | 同样带完整请求体；响应头白名单只有 `x-amzn-requestid` |
 | E. 旁听 OTel 全局 MeterProvider | ❌ | — | Kiro 走私有 provider，**从不注册全局**（已实测） |
-| F. `OTEL_EXPORTER_OTLP_ENDPOINT` 指向本地 | ✅ | ✅ | 改 OS 环境变量 + **整个 Kiro 重启** + 遥测不再上报 AWS |
-| G. hook `https.request` 抄 OTLP 请求体 | ⚠️ | ✅ | 默认 protobuf 需自解码；扩展要经手全部遥测流量 |
-| **H. 给 `dist/extension.js` 打补丁 + `globalThis` 回传** | ⚠️ **最优待验** | ✅ | 改 12.4MB 的 agent 核心；依赖同进程 |
+| F. `OTEL_EXPORTER_OTLP_ENDPOINT` 指向本地 | ❌ | — | 需改 `process.env`，而 kiro-agent **不在本进程**（已实测）；只剩 OS 环境变量 + 整机重启 |
+| G. hook `https.request` 抄 OTLP 请求体 | ❌ | — | 同上，不同进程，hook 不到 |
+| H. 打补丁 + `globalThis` 回传 | ❌ | — | 同上，注入代码与我们不共享 `globalThis` |
+| **I. 打补丁 + 写文件回传** | ⚠️ **唯一可行** | ✅ | 改 12.4MB 的 agent 核心（唯一真风险） |
 
-推荐顺序：**H → F → G**。A/B/E 已排除，C/D 因日志体积被否决。
+推荐：**只剩 I**。A/B/E 数据或接缝不存在；C/D 因日志体积被否决；F/G/H 全部倒在
+「kiro-agent 与本扩展**不同进程**」这一个事实上。
+
+### 进程边界这件事必须先查（已查，结论为「否」）
+
+诊断命令 `Kiro: 遥测旁听可行性探查（诊断）` 实测输出：
+
+```
+kiro-agent 同进程    : 否 / 无法确认
+本进程扩展 main 数 : 7
+```
+
+本扩展所在的扩展宿主里有 7 个扩展 main，但**没有** kiro-agent。判据是
+「同进程必然共享 `require.cache`」。这一个事实同时否掉了 F、G、H 三条：
+
+- F 要在 Kiro 遥测初始化前改 `process.env` —— 不同进程改不到
+- G 要包 `https.request` —— 不同进程包不到
+- H 要经 `globalThis` 回传 —— 不同进程读不到
+
+**结论：任何依赖「和 kiro-agent 共享内存」的方案都不成立。** 补丁本身仍可行，但回传
+通道必须是跨进程的。
 
 ## 2. 数据到底在哪
 
@@ -183,10 +204,11 @@ OTEL_METRIC_EXPORT_INTERVAL = 5000          # 默认 60s 太粗
 - ⚠️ 未验证：esbuild 可能已把 `request` 绑定捕获，后打的 patch 不一定生效
   （与 `Object.freeze(window.vscode)` 同一类坑）
 
-## 5. 推荐方案 H：给 `extension.js` 打补丁 + `globalThis` 回传
+## 5. 唯一可行方案 I：给 `extension.js` 打补丁 + 写文件回传
 
-思路与已上线的「对话面板实时耗时」补丁同构：改 Kiro 磁盘产物，注入一句回调，
-由本扩展在同进程接收。
+思路与已上线的「对话面板实时耗时」补丁同构：改 Kiro 磁盘产物，注入一句代码。
+区别在于**回传通道**——因为不同进程，`globalThis` 不可用，改成注入代码**追加一行文件**、
+本扩展读文件。
 
 ### 5.1 注入点（已只读验证，锚点唯一）
 
@@ -196,14 +218,23 @@ OTEL_METRIC_EXPORT_INTERVAL = 5000          # 默认 60s 太粗
 …this.metrics.reportCountMetrics({success:1},A);let J=Kgt(Z?.message);return this.metrics.reportHistogramMetrics({…},A),…
 ```
 
-在 `let J=Kgt(Z?.message);` 之后插一句：
+在 `let J=Kgt(Z?.message);` 之后插一句（`<PATH>` 由打补丁时写入字面量）：
 
 ```js
-try{globalThis.__kcsUsageTap&&globalThis.__kcsUsageTap(J,A)}catch{}
+try{require("fs").appendFile("<PATH>",JSON.stringify({t:Date.now(),u:J,a:A})+"\n",()=>{})}catch{}
 ```
 
 此处**同时**能拿到用量对象 `J` 与带 `RequestId` 的属性对象 `A`——正是精确归属所需的
-全部信息。插入位置是干净的语句边界。
+全部信息。插入位置是干净的语句边界（`;` 与 `return` 之间）。
+
+回传通道设计要点：
+
+- **异步 + 忽略错误**：用 `appendFile(..., ()=>{})` 而不是 `appendFileSync`，避免给每次
+  模型调用加上同步 IO；回调空实现使任何失败都不影响 Kiro
+- **路径在打补丁时写成字面量**，不依赖环境变量（跨进程传不了），也不依赖 `globalThis`
+- **体积可控**：每次模型调用一行、约 6 个数字 + 一个 requestId，与 C/D 方案的
+  「每轮 284KB 完整上下文」不是一个量级。文件由我们拥有，可按大小轮转/截断
+- **不含任何对话内容**，隐私上优于 C/D
 
 ### 5.2 锚点必须按语义定位，不能写死名字
 
@@ -230,18 +261,17 @@ try{globalThis.__kcsUsageTap&&globalThis.__kcsUsageTap(J,A)}catch{}
 
 各步均**唯一命中**，无歧义。
 
-### 5.3 前提：必须同进程
+### 5.3 进程边界：已确认为「不同进程」，因此不能用 globalThis
 
-`globalThis` 回传要求 kiro-agent 与本扩展在同一 Node 进程。
+曾经的判断依据（现已被推翻）：`Handshake: returning logging config` 这句在
+`extension.js` 里、`StdioClientTransport` 只用于 MCP 子进程、进程列表里没有独立
+agent 进程——这些都只说明 agent 的**代码**在那个 bundle 里，不说明它和我们同宿主。
 
-- 支持证据：`Handshake: returning logging config` 这句就在 `extension.js` 里，说明 ACP 的
-  agent 侧逻辑在扩展内；`StdioClientTransport` 只用于 MCP 子进程；进程列表里没有独立 agent 进程
-- kiro-agent 几乎不往 `globalThis` 写东西（只有一处 `globalThis.awslambda`，属 AWS SDK 死代码），
-  所以**无法间接证明**共享
-- **决定性判据**：`require.cache` 里有没有它的 `extension.js`。同进程 ⇒ 共享
-  `require.cache` 与 `globalThis`。已加入诊断命令（`agentInSameProcess`），只读、零风险
+实测结论见 §1。**写文件回传正是为了绕开这个边界**：它不要求任何内存共享，
+Kiro 那侧只用到 `require("fs")`，我们这侧只需要读一个普通文件。
 
-若判为不同进程，则 F/G/H 三条 in-process 方案全部不成立，只剩 C/D。
+顺带一个教训：判断「能不能 hook」时，先证进程边界，再谈接缝。本次先花了两轮在
+`globalThis` / `process.env` 上，最后被一条 `require.cache` 检查否掉。
 
 ### 5.4 代价与风险
 
@@ -250,16 +280,25 @@ try{globalThis.__kcsUsageTap&&globalThis.__kcsUsageTap(J,A)}catch{}
 - ❌ Kiro 升级会覆盖，需按既有机制自愈重打（同 TurnTimerPatch）
 - ⚠️ 依赖内部结构：Kiro 重构这段代码后锚点可能失效。缓解：锚点建立在语义字符串上，
   且定位失败时**静默降级不显示 token**，不影响主功能
-- ✅ 不改端点、不设环境变量、不重启、遥测照常上报 AWS
+- ⚠️ 每次模型调用多一次异步文件追加。量级可忽略，但确实是我们给 Kiro 加的开销
+- ✅ 不改端点、不设环境变量、不重启、遥测照常上报 AWS、不受进程边界影响
 
 ### 5.5 若继续开发的落地顺序
 
-1. 跑诊断命令确认 `agentInSameProcess = 是`（**前提，不通则放弃 H**）
-2. 先只插一句 `globalThis.__kcsPatchAlive = Date.now()` 的最小标记补丁，reload 后由诊断命令
-   确认能收到 → 同时验证「补丁生效」与「globalThis 共享」
-3. 换成真正的 `__kcsUsageTap(J, A)`，扩展侧按 `RequestId` 收集
-4. 读 `usage_summary.requestIds[]` 做 join，求和后接在原生 footer 后面展示
-5. 复用设置页的探测 / 重试 / 还原三件套
+1. **最小标记补丁**：只插一句 `require("fs").appendFile("<PATH>","alive\n",()=>{})`，
+   reload 后确认文件出现 → 一次同时验证「锚点定位正确」「补丁被加载」「写文件通道可用」
+2. 换成真正的 `{t, u:J, a:A}` 一行 JSON
+3. 扩展侧读该文件，按 `A[RequestId]` 建索引
+4. 读会话的 `usage_summary.requestIds[]` 做 join，求和后接在原生 footer 后面展示
+5. 文件轮转：超过阈值就截断，只保留最近 N 条
+6. 复用设置页的探测 / 重试 / 还原三件套；`applyTurnTimer` 那套备份 + 字节级还原
+   直接照搬（注意备份 12.4MB 会占空间）
+
+### 5.6 已做的准备
+
+- `src/telemetryTap.ts`：只读诊断（进程边界 + OTel 注册表 + 同居扩展列表），
+  命令 `Kiro: 遥测旁听可行性探查（诊断）`
+- 锚点定位算法已在真实文件上验证唯一命中（见 §5.2），但**尚未实现写盘**
 
 ## 6. 相关但独立的发现
 

@@ -75,6 +75,15 @@ export interface OtelProbeResult {
   agentModulePaths: string[];
   /** 本进程加载的扩展 main 模块数量，用于判断是不是共享宿主。 */
   loadedExtensionMains: number;
+  /**
+   * 本进程里加载了哪些扩展（只取扩展 id 段，不暴露完整安装路径）。
+   *
+   * 「kiro-agent 不在我们进程里」这个结论光靠一个 false 不足以让人信服——列出
+   * 实际同居的是哪几个，才能区分「判据失效」与「它确实在别的宿主」。
+   */
+  extensionIdsInProcess: string[];
+  /** 模块缓存里任何含 `kiro` 的路径（用于排查 id 拼写与安装位置差异）。 */
+  kiroRelatedModules: string[];
   /** 探查过程中的异常信息（每条都不致命，收集起来一起看）。 */
   notes: string[];
 }
@@ -95,6 +104,8 @@ export function probeModuleCache(cache?: Record<string, unknown>): {
   agentInSameProcess: boolean;
   agentModulePaths: string[];
   loadedExtensionMains: number;
+  extensionIdsInProcess: string[];
+  kiroRelatedModules: string[];
 } {
   let keys: string[] = [];
   try {
@@ -112,12 +123,25 @@ export function probeModuleCache(cache?: Record<string, unknown>): {
 
   const normalized = keys.map((k) => k.replace(/\\/g, '/'));
   const agentPaths = normalized.filter((k) => /kiro\.kiro-?agent\/.*\.js$/i.test(k));
+
+  // 扩展 id 段：`…/extensions/<id>/…`。只取 id，不带安装路径
+  const ids = new Set<string>();
+  for (const k of normalized) {
+    const m = /\/extensions?\/([^/]+)\//i.exec(k);
+    if (m) ids.add(m[1]);
+  }
+
   return {
     agentInSameProcess: agentPaths.length > 0,
     // 只留尾部，避免把完整安装路径糊满输出面板
     agentModulePaths: agentPaths.slice(0, 5).map((p) => '…/' + p.split('/').slice(-4).join('/')),
     loadedExtensionMains: normalized.filter((k) => /\/extensions?\/[^/]+\/.*extension\.js$/i.test(k))
       .length,
+    extensionIdsInProcess: [...ids].sort(),
+    kiroRelatedModules: normalized
+      .filter((k) => /kiro/i.test(k))
+      .slice(0, 12)
+      .map((p) => '…/' + p.split('/').slice(-3).join('/')),
   };
 }
 
@@ -149,6 +173,8 @@ export function probeOtelGlobals(globalObject: Record<PropertyKey, unknown> = gl
     agentInSameProcess: false,
     agentModulePaths: [],
     loadedExtensionMains: 0,
+    extensionIdsInProcess: [],
+    kiroRelatedModules: [],
     notes: [],
   };
 
@@ -238,6 +264,19 @@ export function renderOtelProbe(r: OtelProbeResult): string[] {
   );
   for (const p of r.agentModulePaths) lines.push('  命中模块        : ' + p);
   lines.push('本进程扩展 main 数 : ' + r.loadedExtensionMains);
+  lines.push('本进程同居扩展     : ' + (r.extensionIdsInProcess.join(', ') || '—'));
+  if (r.kiroRelatedModules.length > 0) {
+    lines.push('含 kiro 的模块     :');
+    for (const p of r.kiroRelatedModules) lines.push('  ' + p);
+  }
+  lines.push('');
+  lines.push(
+    r.agentInSameProcess
+      ? '→ 同进程：globalThis / process.env / require 级别的方案都可考虑。'
+      : '→ **不同进程**：改 process.env、旁听全局对象、hook https.request、以及' +
+          '「打补丁 + globalThis 回传」全部不成立。补丁方案若要继续，回传通道必须换成' +
+          '跨进程的（例如注入代码写一行文件、我们读文件）。'
+  );
   lines.push('');
   lines.push('── OTel 全局注册表 ──');
   lines.push('全局注册表 symbol : ' + (r.registrySymbols.join(', ') || '（未找到）'));
@@ -269,7 +308,8 @@ function verdictOf(r: OtelProbeResult): string {
     return r.agentInSameProcess
       ? '旁听全局 provider 不可行（Kiro 走私有 provider，从不注册全局）；' +
           '但 kiro-agent 与本扩展**同进程**，「给 extension.js 打补丁 + globalThis 回传」这条路成立'
-      : '不可行（既没有 OTel 全局注册表，也未确认与 kiro-agent 同进程）';
+      : '全部 in-process 方案不可行（Kiro 走私有 provider 且 kiro-agent 不在本进程）；' +
+          '仅剩「给 extension.js 打补丁 + 跨进程回传（写文件）」这一条';
   }
   if (!r.hasMeterProvider) return '暂不可行（注册表在，但全局 MeterProvider 还没注册）';
   if ((r.meterProviderName ?? '').toLowerCase().includes('noop')) {

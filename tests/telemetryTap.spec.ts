@@ -53,6 +53,27 @@ describe('probeModuleCache - 进程边界判据', () => {
     expect(r.agentModulePaths).toEqual([]);
   });
 
+  it('列出同居扩展 id，让「不在本进程」这个结论可核对', () => {
+    const r = probeModuleCache({
+      'C:\\x\\extensions\\a.one\\out\\extension.js': 1,
+      'C:\\x\\extensions\\b.two\\out\\extension.js': 1,
+      'C:\\x\\extensions\\a.one\\out\\util.js': 1,
+    });
+    expect(r.extensionIdsInProcess).toEqual(['a.one', 'b.two']);
+    expect(r.loadedExtensionMains).toBe(2);
+  });
+
+  it('含 kiro 的模块单独列出，便于排查 id 拼写与安装位置差异', () => {
+    const r = probeModuleCache({
+      'C:\\x\\extensions\\local.kiro-chat-search-1.5.2\\out\\extension.js': 1,
+      'C:\\x\\extensions\\other\\out\\extension.js': 1,
+    });
+    expect(r.kiroRelatedModules.length).toBe(1);
+    expect(r.kiroRelatedModules[0]).toContain('kiro-chat-search');
+    // 我们自己不算 kiro-agent
+    expect(r.agentInSameProcess).toBe(false);
+  });
+
   it('缓存为空或不可读时降级为「否」，不抛', () => {
     expect(() => probeModuleCache({})).not.toThrow();
     expect(probeModuleCache({}).agentInSameProcess).toBe(false);
