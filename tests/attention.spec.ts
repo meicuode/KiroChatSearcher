@@ -302,6 +302,37 @@ describe('AttentionWatcher - 标题同步', () => {
     expect(writes[1]).toBeUndefined();
   });
 
+  it('isMarked 反映标记态，供调用方决定要不要开兜底对账', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': pendingLine('t1') };
+    const { deps } = makeDeps({ files });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, MARK);
+
+    expect(w.isMarked).toBe(false);
+    await w.refresh();
+    expect(w.isMarked).toBe(true);
+    files['s1/messages.jsonl'] += '\n' + resolvedLine('t1');
+    await w.refresh();
+    expect(w.isMarked).toBe(false);
+  });
+
+  it('确认发生在别处（本进程没收到变更事件）时，下一次对账能把标记摘掉', async () => {
+    // 复现实测遇到的滞留：标记写下后，解决动作由另一个窗口/进程完成，
+    // 本进程只能靠周期性对账发现「已经没人在等了」。
+    const files: Record<string, string> = { 's1/messages.jsonl': pendingLine('t1') };
+    const { deps, writes } = makeDeps({ files });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh();
+    expect(w.isMarked).toBe(true);
+
+    files['s1/messages.jsonl'] += '\n' + resolvedLine('t1');
+    // 没有任何变更事件，直接由对账触发的 refresh 收尾
+    await w.refresh();
+    expect(w.isMarked).toBe(false);
+    expect(writes[writes.length - 1]).toBeUndefined();
+  });
+
   it('dispose 摘掉标记', async () => {
     const { deps, writes } = makeDeps({ files: waiting });
     const w = new AttentionWatcher(deps, MARK);

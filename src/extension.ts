@@ -261,6 +261,9 @@ const ATTENTION_MARK = '* ';
 /** 文件变更后的防抖窗口：`messages.jsonl` 每个事件都会触发一次 change。 */
 const ATTENTION_DEBOUNCE_MS = 400;
 
+/** 已打标记时的兜底对账间隔（只在标记态下轮询，见 `startAttentionWatcher` 里的说明）。 */
+const ATTENTION_RECONCILE_MS = 15_000;
+
 let attentionWatcher: AttentionWatcher | undefined;
 let attentionStatusBar: vscode.StatusBarItem | undefined;
 let attentionDisposables: vscode.Disposable[] = [];
@@ -294,6 +297,32 @@ function readFileTail(file: string, maxBytes: number): string | null {
         /* ignore */
       }
     }
+  }
+}
+
+/**
+ * 还原后清掉空的 `.vscode/settings.json`。
+ *
+ * `update(undefined)` 只删键、不删文件，于是我们走过一趟就会留下一个内容为 `{}` 的
+ * 文件——对本来没有这个文件的项目来说，那是一条凭空多出来的 `git status` 条目。
+ * 只在文件**确实只剩空对象**时删，用户自己有任何配置都不动。
+ *
+ * 打开的是 `.code-workspace` 时不适用（配置写在那个文件里，本函数直接跳过）。
+ */
+function removeEmptyWorkspaceSettings(): void {
+  if (vscode.workspace.workspaceFile) return;
+  const folder = currentWorkspaceFolder();
+  if (!folder) return;
+  const file = path.join(folder.uri.fsPath, '.vscode', 'settings.json');
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    // 只认「空对象」这一种形态：注释、任何键、甚至尾随逗号都算用户内容，一律不动
+    if (raw.replace(/\s/g, '') !== '{}') return;
+    fs.unlinkSync(file);
+    const dir = path.join(folder.uri.fsPath, '.vscode');
+    if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+  } catch {
+    // 文件不存在 / 无权限 / 被占用：留着一个空文件无伤大雅，不值得报错
   }
 }
 
@@ -341,6 +370,7 @@ function buildAttentionDeps(): AttentionDeps {
       await vscode.workspace
         .getConfiguration('window')
         .update('title', value, vscode.ConfigurationTarget.Workspace);
+      if (value === undefined) removeEmptyWorkspaceSettings();
     },
     onStateChange: (pending) => {
       const bar = getAttentionStatusBar();
@@ -381,6 +411,18 @@ function startAttentionWatcher(context: vscode.ExtensionContext): void {
       void watcher.refresh();
     }, ATTENTION_DEBOUNCE_MS);
   };
+
+  // 兜底对账：**只在已打标记时**周期性重扫。
+  //
+  // 摘标记本来依赖 fs.watch 的变更事件，但有两个漏点会让标记滞留：确认发生在
+  // 另一个窗口/进程里（本进程收不到那次写入的通知，或通知被防抖吃掉），以及
+  // 扩展宿主在标记态下被替换（安装新版本时就会发生，实测已滞留过一次）。
+  // 只在标记态下轮询是刻意的：那是唯一可能存在滞留的状态，也把成本限制在
+  // 「真的有人在等」的那段时间里，而不是让 37 个会话文件每 15 秒被读一遍。
+  const reconcile = setInterval(() => {
+    if (watcher.isMarked) void watcher.refresh();
+  }, ATTENTION_RECONCILE_MS);
+  attentionDisposables.push(new vscode.Disposable(() => clearInterval(reconcile)));
 
   void (async () => {
     // 先摘掉上次进程被杀留下的残留标记，再按当前磁盘状态重新判定

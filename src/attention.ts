@@ -241,6 +241,11 @@ export class AttentionWatcher {
     await this.syncTitle(false);
   }
 
+  /** 当前是否处于「已打标记」状态。调用方据此决定要不要开兜底对账。 */
+  get isMarked(): boolean {
+    return this.marked;
+  }
+
   /**
    * 启动时的残留清理：进程上次是被杀掉的（没走到还原）时，标记会留在配置里。
    * 与 {@link refresh} 分开是因为这一步必须**无条件**执行一次，
