@@ -22,6 +22,7 @@
 - 存储占用统计：分类构成、单个会话占用、孤儿执行存档合计，全部**只在用户显式触发时**才扫描磁盘
 - 占用排行页：按占用高低分页展示当前项目全部会话，标题可点击直接打开该对话，并提供逐会话的附件清理 / 全量清理入口
 - 设置页（过滤条右下角齿轮）：开关「在对话过程中显示耗时」，并能检测该设置**实际是否生效**、一键重试与重载窗口
+- 待确认提醒：Kiro 等你批准工具调用时，在**窗口标题**前加 `* `（任务栏/Alt+Tab 可见）并在状态栏提示，多开时一眼看出是哪个窗口卡着
 - 完整的环境校验和友好的中文错误提示
 - 安全：Webview 使用 `default-src 'none'` + nonce 的 CSP，所有动态内容经 HTML 转义
 
@@ -308,6 +309,70 @@ agentActive，且不依赖 minified 代码里的任何符号名。中途 steer �
 之后若无改动则静默。写入失败按错误签名去重提示，只读安装目录不会变成每次启动的噪音。
 在设置页关掉后 `globalState` 记为 `false`，后续启动不再自动写。
 
+## 待确认提醒（PendingApproval）
+
+Kiro 需要批准某个工具调用时会推一条 IDE 内通知，但那条通知会自动消失、也不告诉你是
+**哪个**窗口在等。开着好几个 Kiro 时，经常一小时后才发现第一步都没做完。
+
+开启后（默认开），只要 Kiro 在等你确认：
+
+- **窗口标题**前加 `* ` → 出现在 Alt+Tab、任务栏悬停预览，以及任务栏按钮文字上
+- **状态栏**左侧显示 `🔔 待确认`（警告底色），悬停看具体在问什么
+- 确认后自动还原
+
+关掉：`kiroChatSearch.pendingApproval.enabled` 设为 `false`。
+
+### 怎么知道 Kiro 在等确认
+
+不与 kiro-agent 通信（两个扩展的 webview / 扩展实例之间没有通道），而是读它自己写的
+`messages.jsonl`。里面有一对按 `toolCallId` 配对的事件：
+
+```jsonc
+{"payload":{"type":"pending_interaction","interactionType":"tool_approval",
+            "toolCallId":"toolu_…","question":"Load skill: item","options":[…]}}
+{"payload":{"type":"interaction_resolved","toolCallId":"toolu_…",
+            "outcome":"selected","selectedOption":"always-accept"}}
+```
+
+判定「仍在等待」要两个条件同时成立：
+
+1. 没有同 `toolCallId` 的 `interaction_resolved`
+2. 该 `pending` 之后没有出现 `turn_end`
+
+第 2 条是**防幻影**的关键：进程被杀、窗口被关、整轮被取消，都会留下永远等不到
+`resolved` 的 `pending`。少了它，标记会永久挂在标题上摘不掉。
+
+只读文件**尾部 512KB**：`resolved` 恒在其 `pending` 之后，所以尾窗口里出现的
+`pending`，它的 `resolved`（若有）必然也在同一窗口或更靠后——截尾不会把「已处理」
+误判成「在等」。实测最大 66MB 的会话文件也不会误报。
+
+### 为什么是窗口标题
+
+`window.title` 是唯一能触及 Windows 任务栏的合法手段。实测 Kiro 的操作系统窗口标题
+就是该模板的渲染结果：
+
+```
+tasks.md (Working Tree) (tasks.md) - KiroChatSearcher - Kiro
+```
+
+扩展 API 里**没有**设置任务栏图标叠加（overlay icon）的口子——那是 Electron 的
+`setOverlayIcon` / `setBadgeCount`，没有暴露给扩展。
+
+`*` 是否直接显示在任务栏按钮上，取决于系统的「合并任务栏按钮」设置
+（`HKCU:\…\Explorer\Advanced\TaskbarGlomLevel`）：`0`（总是合并）时只能悬停看到，
+`1`/`2` 时任务栏有文字标签，`*` 直接可见。Alt+Tab 与悬停预览则始终可见。
+
+### 作用域与还原
+
+标记写 **Workspace** 作用域：写 Global 会让所有 Kiro 窗口一起变标记，恰好破坏了
+「多开时分得清」这个目的。代价是等待期间 `.vscode/settings.json`（打开的是
+`.code-workspace` 时则写进那个文件）会出现一处临时改动。
+
+还原策略刻意**不依赖任何持久化的原值**：摘掉标记后，若结果与 global/default 层级
+相同就**删除**工作区层级的键，让配置回到「我们没来过」的样子；否则写回摘标记后的值
+（说明用户自己在工作区层设过标题）。因此即使进程被杀、globalState 丢失，也不会留下
+一个凭空写出来的键。扩展启动时还会主动清理上次遗留的 `*` 前缀。
+
 ## 激活方式
 
 - **活动栏入口**：左侧活动栏的 Kiro Chat Search 图标，点击后在入口面板按"🔍 打开搜索"
@@ -579,6 +644,7 @@ src/
   storage/cleaner.ts  # SessionCleaner：清理会话数据，可写磁盘
   turnTimer.ts        # TurnTimerPatch：探测 / 注入 / 还原对话面板补丁，唯一会写 Kiro 安装目录的模块
   settings.ts         # 设置页：HTML（纯函数）+ 面板生命周期，注入宿主能力便于测试
+  attention.ts        # PendingApproval：解析待确认事件 + 窗口标题标记（不 import vscode）
   webview/turnTimer.ts # 设置页状态行文案的纯函数（turnTimerStatusLabel）
 media/
   kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）

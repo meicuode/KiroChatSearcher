@@ -29,6 +29,7 @@ import {
   type ConfirmPrompt,
 } from './storage/cleaner';
 import { buildClassifyRoots } from './storage/classify';
+import { AttentionWatcher, type AttentionDeps } from './attention';
 import { SettingsPanel, type SettingsPanelDeps } from './settings';
 import {
   applyTurnTimer,
@@ -242,6 +243,186 @@ async function syncTurnTimerOnActivate(context: vscode.ExtensionContext): Promis
     await setTurnTimerEnabled(context, false);
     runTurnTimerAction(context, 'revert');
   }
+}
+
+// ---------------------------------------------------------------------------
+// 待确认提醒（PendingApproval）：Kiro 等你批准工具调用时，在窗口标题上打标记
+//
+// 检测不与 kiro-agent 通信（两个扩展之间没有通道），而是读它自己写的
+// `messages.jsonl` 里的 `pending_interaction` / `interaction_resolved` 事件对。
+// 解析规则与标题改写在 `src/attention.ts`（纯逻辑、可单测）；本节只负责把
+// 真实的 fs / vscode 配置 / 状态栏接上去，并管好文件监听的防抖。
+// ---------------------------------------------------------------------------
+
+/** 等待确认时加在 `window.title` 前面的标记。 */
+const ATTENTION_MARK = '* ';
+
+/** 文件变更后的防抖窗口：`messages.jsonl` 每个事件都会触发一次 change。 */
+const ATTENTION_DEBOUNCE_MS = 400;
+
+let attentionWatcher: AttentionWatcher | undefined;
+let attentionStatusBar: vscode.StatusBarItem | undefined;
+let attentionDisposables: vscode.Disposable[] = [];
+let attentionTimer: NodeJS.Timeout | undefined;
+
+/**
+ * 读文件尾部最多 `maxBytes` 字节。
+ *
+ * 不整读：单个会话的 `messages.jsonl` 可达数 MB，而判断「现在有没有人在等」只需要
+ * 最后一轮的事件（`turn_end` 会把更早的 pending 全部作废）。
+ * 从中间截断必然切坏第一行，交由逐行解析时跳过——这正是 `scanPendingInteractions`
+ * 的坏行容错要覆盖的情形。
+ */
+function readFileTail(file: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    const size = fs.statSync(file).size;
+    const length = Math.min(size, maxBytes);
+    if (length <= 0) return '';
+    const buf = Buffer.allocUnsafe(length);
+    fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buf, 0, length, size - length);
+    return buf.toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function attentionEnabled(): boolean {
+  return vscode.workspace
+    .getConfiguration('kiroChatSearch')
+    .get<boolean>('pendingApproval.enabled', true);
+}
+
+function getAttentionStatusBar(): vscode.StatusBarItem {
+  if (!attentionStatusBar) {
+    // 靠左、优先级高：等待确认是「现在就该看一眼」的信息，不该被挤到右边一堆项里
+    attentionStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
+    attentionStatusBar.command = 'kiroChatSearch.toggleView';
+  }
+  return attentionStatusBar;
+}
+
+/** 装配注入依赖：这里是本功能唯一接触 fs / vscode 配置的地方。 */
+function buildAttentionDeps(): AttentionDeps {
+  return {
+    sessionDir: () => {
+      const env = checkEnv();
+      return env.ok && env.newWorkspaceDir ? env.newWorkspaceDir : null;
+    },
+    listDir: (dir) => {
+      try {
+        return fs.readdirSync(dir);
+      } catch {
+        return null;
+      }
+    },
+    readTail: (file, maxBytes) => readFileTail(file, maxBytes),
+    readTitle: () => {
+      const inspected = vscode.workspace.getConfiguration('window').inspect<string>('title');
+      return {
+        workspaceValue: inspected?.workspaceValue,
+        globalValue: inspected?.globalValue,
+        defaultValue: inspected?.defaultValue,
+      };
+    },
+    writeTitle: async (value) => {
+      // 必须写 Workspace 作用域：写 Global 会让**所有** Kiro 窗口一起变标记，
+      // 恰好破坏了「多开时分得清是哪个窗口在等」这个目的。
+      await vscode.workspace
+        .getConfiguration('window')
+        .update('title', value, vscode.ConfigurationTarget.Workspace);
+    },
+    onStateChange: (pending) => {
+      const bar = getAttentionStatusBar();
+      if (pending.length === 0) {
+        bar.hide();
+        return;
+      }
+      const first = pending[0].question || pending[0].interactionType || '等待确认';
+      bar.text =
+        pending.length > 1 ? `$(bell-dot) 待确认 ${pending.length}` : '$(bell-dot) 待确认';
+      bar.tooltip = pending.map((p) => '• ' + (p.question || p.toolCallId)).join('\n');
+      bar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      bar.accessibilityInformation = { label: `Kiro 等待确认：${first}` };
+      bar.show();
+    },
+    log: (message) => logTurnTimer(message),
+  };
+}
+
+/**
+ * 启动待确认监视。
+ *
+ * 监听整个工作区会话目录（递归）而不是某一个会话文件：会话可以随时新建，
+ * 而「哪个会话在等」对用户没有区别——他只需要知道这个窗口在等。
+ */
+function startAttentionWatcher(context: vscode.ExtensionContext): void {
+  stopAttentionWatcher();
+  if (!attentionEnabled()) return;
+
+  const deps = buildAttentionDeps();
+  const watcher = new AttentionWatcher(deps, ATTENTION_MARK);
+  attentionWatcher = watcher;
+
+  const schedule = () => {
+    if (attentionTimer) clearTimeout(attentionTimer);
+    attentionTimer = setTimeout(() => {
+      attentionTimer = undefined;
+      void watcher.refresh();
+    }, ATTENTION_DEBOUNCE_MS);
+  };
+
+  void (async () => {
+    // 先摘掉上次进程被杀留下的残留标记，再按当前磁盘状态重新判定
+    await watcher.clearStaleMark();
+    await watcher.refresh();
+  })();
+
+  const dir = deps.sessionDir();
+  if (dir) {
+    try {
+      const fsWatcher = fs.watch(dir, { recursive: true }, () => schedule());
+      attentionDisposables.push(new vscode.Disposable(() => fsWatcher.close()));
+    } catch (e: unknown) {
+      // 递归监听在个别文件系统上不被支持：退化成定时轮询，功能不至于整体失效
+      logTurnTimer('[待确认] 目录监听失败，改为轮询：' + String(e));
+      const poll = setInterval(() => void watcher.refresh(), 5000);
+      attentionDisposables.push(new vscode.Disposable(() => clearInterval(poll)));
+    }
+  }
+
+  // 工作区变化（新增/移除文件夹）后会话目录会变，重建监听
+  attentionDisposables.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => startAttentionWatcher(context))
+  );
+}
+
+function stopAttentionWatcher(): void {
+  if (attentionTimer) {
+    clearTimeout(attentionTimer);
+    attentionTimer = undefined;
+  }
+  while (attentionDisposables.length) {
+    const d = attentionDisposables.pop();
+    try {
+      d?.dispose();
+    } catch {
+      /* ignore */
+    }
+  }
+  const watcher = attentionWatcher;
+  attentionWatcher = undefined;
+  if (watcher) void watcher.dispose();
+  attentionStatusBar?.hide();
 }
 
 /** 设置页命令与齿轮入口的落点：装配宿主能力后打开单例面板。 */
@@ -1340,9 +1521,24 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
+  // 待确认提醒：监听会话文件，Kiro 等你批准时在窗口标题上打标记。
+  // 开关变化时重建（关闭时会把标记摘掉）。
+  startAttentionWatcher(context);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('kiroChatSearch.pendingApproval.enabled')) {
+        startAttentionWatcher(context);
+      }
+    })
+  );
+  context.subscriptions.push(new vscode.Disposable(() => stopAttentionWatcher()));
+
   // 对话耗时补丁的自动补齐放在最后：命令已注册，通知里的「打开设置」按钮才一定可用。
   // 不 await——它只做几次小文件读写，但没有理由让它挡住 activate 的返回。
   void syncTurnTimerOnActivate(context);
 }
 
-export function deactivate() {}
+export function deactivate() {
+  // 标记写在配置里，不摘掉会一直留在标题上，所以停用时必须还原。
+  stopAttentionWatcher();
+}
