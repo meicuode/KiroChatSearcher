@@ -63,8 +63,62 @@ export interface OtelProbeResult {
   meterMethods: string[];
   /** 全局 TracerProvider 的构造函数名（span 属性是另一条可能的取数路径）。 */
   tracerProviderName: string | null;
+  /**
+   * kiro-agent 的 `extension.js` 是否出现在本进程的模块缓存里。
+   *
+   * 这是「两个扩展是否同进程」的**决定性判据**，也是所有 in-process 方案
+   * （改 `process.env`、旁听全局对象、给 `extension.js` 打补丁后经 `globalThis` 回传）
+   * 成立的前提。零风险：只读 `require.cache` 的键名。
+   */
+  agentInSameProcess: boolean;
+  /** 命中的模块路径（截断后便于阅读）。 */
+  agentModulePaths: string[];
+  /** 本进程加载的扩展 main 模块数量，用于判断是不是共享宿主。 */
+  loadedExtensionMains: number;
   /** 探查过程中的异常信息（每条都不致命，收集起来一起看）。 */
   notes: string[];
+}
+
+/**
+ * 只读检查模块缓存，判断 kiro-agent 是否与本扩展同进程。
+ *
+ * 依据：Node 里同一进程的所有模块共享 `require.cache` 与 `globalThis`。若
+ * kiro-agent 的 `extension.js` 在缓存里，就说明它被**本进程**加载过，于是
+ * `globalThis` 必然共享——这是所有 in-process 取数方案的前提。
+ *
+ * 反之若不在，说明 VS Code 把它放到了另一个扩展宿主，那么改 `process.env`、
+ * 旁听全局对象、以及「打补丁后经 `globalThis` 回传」三条路全部不成立。
+ *
+ * 可注入 `cache` 便于单测；生产路径读真实 `require.cache`。
+ */
+export function probeModuleCache(cache?: Record<string, unknown>): {
+  agentInSameProcess: boolean;
+  agentModulePaths: string[];
+  loadedExtensionMains: number;
+} {
+  let keys: string[] = [];
+  try {
+    // 用 eval 拿 require.cache：本文件在 vitest（ESM）下也会被 import，
+    // 直接引用 require 会在 ESM 里抛错。注入了 cache 时完全不碰 require。
+    const c =
+      cache ??
+      (typeof require !== 'undefined'
+        ? (require.cache as unknown as Record<string, unknown>)
+        : undefined);
+    if (c) keys = Object.keys(c);
+  } catch {
+    keys = [];
+  }
+
+  const normalized = keys.map((k) => k.replace(/\\/g, '/'));
+  const agentPaths = normalized.filter((k) => /kiro\.kiro-?agent\/.*\.js$/i.test(k));
+  return {
+    agentInSameProcess: agentPaths.length > 0,
+    // 只留尾部，避免把完整安装路径糊满输出面板
+    agentModulePaths: agentPaths.slice(0, 5).map((p) => '…/' + p.split('/').slice(-4).join('/')),
+    loadedExtensionMains: normalized.filter((k) => /\/extensions?\/[^/]+\/.*extension\.js$/i.test(k))
+      .length,
+  };
 }
 
 /**
@@ -92,8 +146,13 @@ export function probeOtelGlobals(globalObject: Record<PropertyKey, unknown> = gl
     meterName: null,
     meterMethods: [],
     tracerProviderName: null,
+    agentInSameProcess: false,
+    agentModulePaths: [],
+    loadedExtensionMains: 0,
     notes: [],
   };
+
+  Object.assign(out, probeModuleCache());
 
   let registry: Record<string, unknown> | undefined;
   for (const major of CANDIDATE_MAJORS) {
@@ -172,6 +231,15 @@ export function renderOtelProbe(r: OtelProbeResult): string[] {
   lines.push('');
   lines.push('结论：' + verdictOf(r));
   lines.push('');
+  lines.push('── 进程边界（所有 in-process 方案的前提）──');
+  lines.push(
+    'kiro-agent 同进程    : ' +
+      (r.agentInSameProcess ? '是（globalThis 与 require.cache 共享）' : '否 / 无法确认')
+  );
+  for (const p of r.agentModulePaths) lines.push('  命中模块        : ' + p);
+  lines.push('本进程扩展 main 数 : ' + r.loadedExtensionMains);
+  lines.push('');
+  lines.push('── OTel 全局注册表 ──');
   lines.push('全局注册表 symbol : ' + (r.registrySymbols.join(', ') || '（未找到）'));
   lines.push('注册表键          : ' + (r.registryKeys.join(', ') || '—'));
   lines.push('API 版本          : ' + (r.apiVersion ?? '—'));
@@ -195,7 +263,14 @@ export function renderOtelProbe(r: OtelProbeResult): string[] {
  * 两者的下一步完全不同（前者要换取数路径，后者只要等遥测初始化）。
  */
 function verdictOf(r: OtelProbeResult): string {
-  if (r.registrySymbols.length === 0) return '不可行（同进程里没有 OTel 全局注册表）';
+  if (r.registrySymbols.length === 0) {
+    // 注册表没有不代表整条路都断：先报进程边界，因为它决定「打补丁 + globalThis 回传」
+    // 这条替代方案是否成立——两个结论的下一步完全不同。
+    return r.agentInSameProcess
+      ? '旁听全局 provider 不可行（Kiro 走私有 provider，从不注册全局）；' +
+          '但 kiro-agent 与本扩展**同进程**，「给 extension.js 打补丁 + globalThis 回传」这条路成立'
+      : '不可行（既没有 OTel 全局注册表，也未确认与 kiro-agent 同进程）';
+  }
   if (!r.hasMeterProvider) return '暂不可行（注册表在，但全局 MeterProvider 还没注册）';
   if ((r.meterProviderName ?? '').toLowerCase().includes('noop')) {
     return '注册表与 provider 都在，但当前是 Noop（遥测未启用或已被关闭），此刻抄不到数据';

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { probeOtelGlobals, renderOtelProbe } from '../src/telemetryTap';
+import { probeModuleCache, probeOtelGlobals, renderOtelProbe } from '../src/telemetryTap';
 
 /**
  * 遥测旁听探查是「在陌生环境里报告事实」的工具，因此它的价值全在于
@@ -33,6 +33,44 @@ class NoopMeterProvider {
     return new FakeMeter();
   }
 }
+
+describe('probeModuleCache - 进程边界判据', () => {
+  it('模块缓存里有 kiro-agent 的 extension.js → 判为同进程', () => {
+    const r = probeModuleCache({
+      'D:\\Program Files\\Kiro\\resources\\app\\extensions\\kiro.kiro-agent\\dist\\extension.js': 1,
+      'C:\\Users\\me\\.kiro\\extensions\\local.kiro-chat-search-1.5.1\\out\\extension.js': 1,
+    });
+    expect(r.agentInSameProcess).toBe(true);
+    expect(r.agentModulePaths[0]).toContain('kiro.kiro-agent');
+    expect(r.loadedExtensionMains).toBeGreaterThanOrEqual(1);
+  });
+
+  it('缓存里没有 kiro-agent → 判为不同进程（in-process 方案全部不成立）', () => {
+    const r = probeModuleCache({
+      'C:\\x\\extensions\\other.ext\\out\\extension.js': 1,
+    });
+    expect(r.agentInSameProcess).toBe(false);
+    expect(r.agentModulePaths).toEqual([]);
+  });
+
+  it('缓存为空或不可读时降级为「否」，不抛', () => {
+    expect(() => probeModuleCache({})).not.toThrow();
+    expect(probeModuleCache({}).agentInSameProcess).toBe(false);
+  });
+
+  it('命中路径只保留尾部，不把完整安装路径糊满输出', () => {
+    const r = probeModuleCache({
+      'D:\\a\\b\\c\\d\\e\\extensions\\kiro.kiro-agent\\dist\\extension.js': 1,
+    });
+    expect(r.agentModulePaths[0].startsWith('…/')).toBe(true);
+    expect(r.agentModulePaths[0]).not.toContain('a/b/c');
+  });
+
+  it('kiro.kiroagent（无连字符）的写法同样命中', () => {
+    const r = probeModuleCache({ '/x/extensions/kiro.kiroagent/dist/extension.js': 1 });
+    expect(r.agentInSameProcess).toBe(true);
+  });
+});
 
 describe('probeOtelGlobals - 结论判定', () => {
   it('注册表不存在 → 不可行，且给出可能原因', () => {

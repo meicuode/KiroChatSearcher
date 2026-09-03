@@ -671,7 +671,10 @@ src/
   webview/turnTimer.ts # 设置页状态行文案的纯函数（turnTimerStatusLabel）
 media/
   kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）
+  telemetryTap.ts     # 只读诊断：进程边界与 OTel 全局注册表探查（取真实 token 的可行性）
 tests/                # vitest 单元测试与 fast-check 属性测试
+docs/
+  token-usage-research.md  # 取真实 token / 缓存命中率的全部方案、依据与代价（研究记录）
 ```
 
 ## 测试
