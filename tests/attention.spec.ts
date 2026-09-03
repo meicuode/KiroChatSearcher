@@ -242,6 +242,66 @@ describe('AttentionWatcher - 标题同步', () => {
     expect(states[0].map((p) => p.toolCallId)).toEqual(['t1']);
   });
 
+  it('同一项目下多个会话在等 → 汇总计数，逐个确认时标记一直保留到最后一个', async () => {
+    // 这是多开/多会话的核心行为：只要还有任意一个会话在等，窗口标记就不能摘。
+    const files: Record<string, string> = {
+      's1/messages.jsonl': pendingLine('t1', '会话1 要批准'),
+      's2/messages.jsonl': pendingLine('t2', '会话2 要批准'),
+      's3/messages.jsonl': pendingLine('t3', '会话3 要批准'),
+    };
+    const { deps, writes, states } = makeDeps({ files });
+    // 让 readTail 每次都按当前 files 取值（模拟磁盘被 Kiro 追加改写）
+    deps.readTail = (file) => {
+      const key = Object.keys(files).find((k) => file.replace(/\\/g, '/').includes('/' + k));
+      return key === undefined ? null : files[key];
+    };
+    const w = new AttentionWatcher(deps, MARK);
+
+    await w.refresh();
+    expect(w.pending.map((p) => p.toolCallId).sort()).toEqual(['t1', 't2', 't3']);
+    expect(writes).toEqual(['* ${dirty}${activeEditorShort}']);
+
+    // 确认掉第 1 个 → 还剩 2 个，标记必须保留（不能有新的写入，尤其不能写 undefined）
+    files['s1/messages.jsonl'] += '\n' + resolvedLine('t1');
+    await w.refresh();
+    expect(w.pending.map((p) => p.toolCallId).sort()).toEqual(['t2', 't3']);
+    expect(writes).toHaveLength(1);
+
+    // 再确认掉第 2 个 → 还剩 1 个，标记依然保留
+    files['s2/messages.jsonl'] += '\n' + resolvedLine('t2');
+    await w.refresh();
+    expect(w.pending.map((p) => p.toolCallId)).toEqual(['t3']);
+    expect(writes).toHaveLength(1);
+
+    // 最后一个也确认掉 → 这时才还原
+    files['s3/messages.jsonl'] += '\n' + resolvedLine('t3');
+    await w.refresh();
+    expect(w.pending).toEqual([]);
+    expect(writes).toEqual(['* ${dirty}${activeEditorShort}', undefined]);
+
+    // 状态回调把每一次数量变化都报了出去（状态栏据此显示「待确认 N」）
+    expect(states.map((s) => s.length)).toEqual([3, 2, 1, 0]);
+  });
+
+  it('一个会话里同时挂着多个待确认，逐个确认同样只在清空后还原', async () => {
+    const files: Record<string, string> = {
+      's1/messages.jsonl': [pendingLine('a'), pendingLine('b')].join('\n'),
+    };
+    const { deps, writes } = makeDeps({ files });
+    deps.readTail = () => files['s1/messages.jsonl'];
+    const w = new AttentionWatcher(deps, MARK);
+
+    await w.refresh();
+    expect(w.pending).toHaveLength(2);
+    files['s1/messages.jsonl'] += '\n' + resolvedLine('a');
+    await w.refresh();
+    expect(w.pending.map((p) => p.toolCallId)).toEqual(['b']);
+    expect(writes).toHaveLength(1); // 仍在等 → 不还原
+    files['s1/messages.jsonl'] += '\n' + resolvedLine('b');
+    await w.refresh();
+    expect(writes[1]).toBeUndefined();
+  });
+
   it('dispose 摘掉标记', async () => {
     const { deps, writes } = makeDeps({ files: waiting });
     const w = new AttentionWatcher(deps, MARK);
