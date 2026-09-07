@@ -72,26 +72,39 @@
  * （`SessionView` 渲染的是 `.session-view-root` > `.session-view-container`，
  * 切换后是全新的元素），于是记住的那些节点全部失效，计时就再也不显示了。
  *
- * 现在改成**每次刷新都重新在文档里找横条**，配对规则：
- *   1. 先按会话子树精确配——捕获到的会话视图还活着时（没切过会话）恒走这条；
- *   2. 剩下的（视图被重建过、记住的元素已失效）按「可见优先 + 最新优先」配上
- *      剩下的横条，并**顺手把捕获的元素刷新成新的那一棵**，于是下一次又能走 1；
- *   3. 一条横条都没有、而捕获到的会话视图还活着 → 退到该会话自己的消息流末尾
- *      （Kiro 换了横条类名时的兜底，仍然不会串到别的会话去）；
- *   4. 连会话视图都没捕获到 → 右下角浮动（最后兜底，宁可位置怪也不要看不见）。
+ * 现在改成**每次刷新都重新在文档里找横条**，再问每条横条「你属于哪个会话」。
  *
- * 这样两种挂载模型都成立：隐藏的会话视图**留在 DOM 里**时，它的横条也还在、
- * 计时留在那条（不可见）横条上，切回来就看得见；被**整棵卸载**时，文档里根本没有
- * 它的横条，于是什么都不显示——两种情况下空闲会话都不会莫名出现别人的计时。
+ * ── 横条属于哪个会话：走 React fiber 精确认人 ────────────────────
+ *
+ * Kiro 的 DOM 上没有任何会话标记，但它是 React 应用，而 React 把内部指针挂成 DOM
+ * 节点的自有属性（`"__reactFiber$" + Math.random().toString(36).slice(2)`）。
+ * 会话身份在组件树里是显式传递的——每个会话一个自己的 store
+ * （`t => ly((e,n) => ({ sessionId: t, session: [], … }))`），外面还包着一个以
+ * `sessionId` 为 prop 的 provider。
+ *
+ * 于是：从横条的 fiber 沿 `return` 往上走，找第一个能取出 `sessionId` 的祖先。
+ * 这个配对是**精确**的，与同时跑几个会话无关。全程只读、包在 try 里。
+ *
+ * 解析不出来（React 换了大版本）时**不猜**：只有在完全无歧义（没配上的轮恰好一个、
+ * 身份不明的横条也恰好一条）时才配；否则放弃横条这个落点。宁可不显示，
+ * 也不显示一个可能配反的数字——显示错的比不显示更糟，因为你没法判断它对不对。
+ *
+ * 落点优先级：
+ *   1. 本会话的横条（fiber 精确配对，或无歧义时的兜底配对）；
+ *   2. 一条横条都没有、而捕获到的会话视图还活着 → 退到该会话自己的消息流末尾
+ *      （Kiro 换了横条类名时的兜底，仍然不会串到别的会话去）；
+ *   3. 连会话视图都没捕获到 → 右下角浮动（最后兜底，宁可位置怪也不要看不见）。
+ *
+ * 配上横条后会顺手把捕获的会话视图元素刷新成当前这一棵，所以第 2 条在会话视图被
+ * 重建之后依然可用。两种挂载模型也都成立：隐藏的会话视图**留在 DOM 里**时它的横条
+ * 也还在、计时留在那条（不可见）横条上，切回来就看得见；被**整棵卸载**时文档里根本
+ * 没有它的横条，于是什么都不显示。两种情况下空闲会话都不会莫名出现别人的计时。
  *
  * ── 已知边界 ──────────────────────────────────────────────────
  * - 面板在轮进行中被重建（reload window）时，那次 `prompt` 的请求不是本 webview
  *   发的，起始时间无从得知，此时不显示计时（不猜）。
- * - **多个会话同时在跑**且它们的会话视图都被重建过时，横条与轮的配对退化成
- *   「可见优先 + 最新优先」的启发式，可能把两个数字配反。单会话在跑（绝大多数
- *   情形）没有这个问题。
- * - 同一会话同时开在侧边栏和编辑器分栏、而那一轮是另一个 webview 发起的：本 webview
- *   没有它的轮记录却能看到它的横条，此时可能把本 webview 某一轮的时间填进去。
+ * - 横条解析出的会话不在本 webview 的轮记录里（例如同一会话同时开在侧边栏和编辑器
+ *   分栏、而那一轮是另一边发起的），这条横条就不用——不是我们的，不往里写。
  */
 
 (() => {
@@ -131,7 +144,7 @@
    * `__kcsTurnTimer`——立刻知道钩子挂上了没、跑过几轮、每一行落在哪。
    */
   const diag = {
-    version: 5,
+    version: 6,
     /** 消息钩子是否已装上（false 则实时耗时一定不会出现）。 */
     hooked: false,
     /** 钩子装不上的原因。 */
@@ -144,11 +157,21 @@
     superseded: 0,
     /** 会话视图被重建后重新认领横条的次数（切走再切回会 +1）。 */
     reacquired: 0,
+    /** 靠 React fiber 精确认出横条属于哪个会话的次数。 */
+    fiberHits: 0,
+    /** fiber 取不到身份、但局面无歧义因而仍然配上的次数。 */
+    fallbackPairs: 0,
+    /** fiber 取不到身份且局面有歧义、因而**放弃显示**的次数（宁可不显示也不显示错的）。 */
+    ambiguous: 0,
     /** 当前各行的落点：`bar` / `inline` / `floating` / `waiting` / `detached`。 */
     anchors: [],
     /** 文档里当前有几条 "Working" 横条。 */
     get bars() {
       return collectBars().length;
+    },
+    /** 当前每条横条解析出的 sessionId（`''` = 没解析出来）。排查配对时看这个。 */
+    get barSessions() {
+      return collectBars().map((b) => barSessionId(b));
     },
     /** 正在跑的轮数。 */
     get running() {
@@ -299,55 +322,133 @@
     return null;
   }
 
+  /* ---------------- 横条 → sessionId：走 React fiber 精确认人 ---------------- */
+
+  /**
+   * 已解析过的横条 → sessionId 缓存。
+   *
+   * 一条横条在它的生命周期里只属于一个会话，所以按元素缓存是安全的；
+   * 而 fiber 上溯每 200ms 做一遍就太浪费了。会话视图重建后是新元素，自然重新解析。
+   */
+  const barSessionCache = new WeakMap();
+
+  /**
+   * 取 DOM 节点上的 React fiber。
+   *
+   * React 把内部指针挂成节点的**自有属性**，属性名带一个进程内随机后缀：
+   *
+   *     var me = Math.random().toString(36).slice(2),
+   *         At = "__reactFiber$" + me,
+   *         Bt = "__reactProps$" + me;
+   *
+   * 所以只能扫属性名前缀，不能写死。
+   */
+  function fiberOf(el) {
+    for (const key of Object.keys(el)) {
+      if (key.indexOf('__reactFiber$') === 0) return el[key];
+    }
+    return null;
+  }
+
+  /** 从一个 fiber 的 props / context value 里尽力取出 sessionId。 */
+  function sessionIdFromProps(props) {
+    if (!props || typeof props !== 'object') return '';
+    if (typeof props.sessionId === 'string' && props.sessionId) return props.sessionId;
+    // context provider：value 可能直接带 sessionId，也可能是该会话专属的 store
+    const value = props.value;
+    if (value && typeof value === 'object') {
+      if (typeof value.sessionId === 'string' && value.sessionId) return value.sessionId;
+      if (typeof value.getState === 'function') {
+        const state = value.getState();
+        if (state && typeof state.sessionId === 'string' && state.sessionId) return state.sessionId;
+      }
+    }
+    return '';
+  }
+
+  /**
+   * 这条横条属于哪个会话。
+   *
+   * Kiro 的会话身份在组件树里是显式传下来的——每个会话有一个自己的 store
+   * （`t => ly((e,n) => ({ sessionId: t, session: [], … }))`），外面还包着一个以
+   * `sessionId` 为 prop 的 provider。所以从横条的 fiber 沿 `return` 往上走，
+   * 找第一个能取出 sessionId 的祖先即可。**这是精确的**，与并行几个会话无关。
+   *
+   * 全程只读、包在 try 里：这是 React 内部结构，换了大版本可能失效，
+   * 失效时返回 `''` 交给上层的「无歧义才配、否则不显示」兜底，而不是猜。
+   */
+  function barSessionId(bar) {
+    if (barSessionCache.has(bar)) return barSessionCache.get(bar);
+    let sid = '';
+    try {
+      let cur = fiberOf(bar);
+      for (let i = 0; i < 80 && cur; i++) {
+        sid = sessionIdFromProps(cur.memoizedProps);
+        if (sid) break;
+        cur = cur.return;
+      }
+    } catch {
+      sid = '';
+    }
+    barSessionCache.set(bar, sid);
+    if (sid) diag.fiberHits += 1;
+    return sid;
+  }
+
   /**
    * 给每一轮配一条横条。
    *
-   * 两轮配对，顺序有讲究：
-   *   1. **按会话子树精确配**：捕获到的会话视图还活着（没切过会话），
-   *      那么它子树里的横条一定就是这一轮的，不存在猜错。
-   *   2. 剩下的按「**可见优先 + 最新优先**」配剩下的横条：会话视图被重建过之后
-   *      记住的元素全失效了，只能启发式——而用户正看着的那条横条，最可能属于
-   *      最近发起的那一轮。配上之后会**刷新捕获的元素**，于是下一次又能走 1。
+   * 1. **精确**：每条横条走 React fiber 问出自己的 sessionId，直接对上同 id 的那一轮。
+   *    解析出来但不在我们跟踪的会话里（例如那一轮是另一个 webview 发起的），
+   *    这条横条就**不用**——不是我们的，别往里写。
+   * 2. **兜底**：fiber 取不到身份时，只有在**完全无歧义**（没配上的轮恰好一个、
+   *    身份不明的横条也恰好一条）时才配；否则宁可不显示，也不显示一个可能配反的数字。
+   *
+   * 配上之后顺手把捕获的会话视图元素刷新成当前这一棵，让「没有横条时退到消息流」
+   * 那条兜底在会话视图被重建后依然可用。
    */
   function resolveBars() {
     const map = new Map();
     if (turns.size === 0) return map;
-    const all = collectBars();
-    if (all.length === 0) return map;
+    const bars = collectBars();
+    if (bars.length === 0) return map;
 
-    const used = new Set();
-    for (const turn of turns.values()) {
-      const root = turn.root && isAttached(turn.root) ? turn.root : null;
-      if (!root || typeof root.querySelector !== 'function') continue;
-      const bar = root.querySelector(BAR_SELECTOR);
-      if (bar && !used.has(bar)) {
-        map.set(turn, bar);
-        used.add(bar);
+    const unresolved = [];
+    for (const bar of bars) {
+      const sid = barSessionId(bar);
+      if (!sid) {
+        unresolved.push(bar);
+        continue;
+      }
+      const turn = turns.get(sid);
+      if (turn && !map.has(turn)) map.set(turn, bar);
+    }
+
+    if (unresolved.length > 0) {
+      const rest = [...turns.values()].filter((t) => !map.has(t));
+      if (unresolved.length === 1 && rest.length === 1) {
+        map.set(rest[0], unresolved[0]);
+        diag.fallbackPairs += 1;
+      } else if (rest.length > 0) {
+        // 有歧义：放弃这些轮的横条落点（上层会退到各自的消息流，或什么都不显示）
+        diag.ambiguous += 1;
       }
     }
 
-    const orphans = [...turns.values()]
-      .filter((t) => !map.has(t))
-      .sort((a, b) => b.startedAt - a.startedAt);
-    if (orphans.length === 0) return map;
-
-    const free = all
-      .filter((b) => !used.has(b))
-      .sort((a, b) => (isVisible(a) ? 0 : 1) - (isVisible(b) ? 0 : 1));
-
-    for (let i = 0; i < orphans.length && i < free.length; i++) {
-      const turn = orphans[i];
-      map.set(turn, free[i]);
-      // 重新认领：把捕获的元素换成新那一棵，下次就能走精确配对
-      const root = sessionRootOf(free[i]);
-      if (root && root !== turn.root) {
-        turn.root = root;
-        const content = typeof root.querySelector === 'function' ? root.querySelector(CONTENT_SELECTOR) : null;
-        if (content) turn.content = content;
-        diag.reacquired += 1;
-      }
-    }
+    for (const [turn, bar] of map) refreshCapture(turn, bar);
     return map;
+  }
+
+  /** 把捕获的会话视图元素换成横条所在的这一棵（会话视图重建后靠这个自愈）。 */
+  function refreshCapture(turn, bar) {
+    const root = sessionRootOf(bar);
+    if (!root || root === turn.root) return;
+    turn.root = root;
+    if (typeof root.querySelector === 'function') {
+      const content = root.querySelector(CONTENT_SELECTOR);
+      if (content) turn.content = content;
+    }
+    diag.reacquired += 1;
   }
 
   /**

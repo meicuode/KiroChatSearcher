@@ -149,6 +149,27 @@ function makeEl(tagName: string, onRegister?: (el: El) => void): El {
   return el;
 }
 
+/**
+ * 给元素挂上 React fiber 替身。
+ *
+ * 照抄 React 的真实形态：属性名是 `"__reactFiber$" + 随机后缀`（脚本只能扫前缀），
+ * fiber 用 `return` 串成链，会话身份放在某个祖先的 `memoizedProps.sessionId` 上
+ * ——Kiro 的组件树里就是这样：每个会话一个自己的 store，外面包一个带 sessionId 的
+ * provider。这里刻意在链上多垫几层无关 fiber，确保脚本真的会往上走。
+ */
+function attachFiber(el: El, sessionId: string, kind: 'prop' | 'store' = 'prop'): void {
+  const provider =
+    kind === 'prop'
+      ? { memoizedProps: { sessionId }, return: null }
+      : { memoizedProps: { value: { getState: () => ({ sessionId }) } }, return: null };
+  const mid2 = { memoizedProps: { className: 'whatever' }, return: provider };
+  const mid1 = { memoizedProps: {}, return: mid2 };
+  (el as unknown as Record<string, unknown>)['__reactFiber$' + 'kcs9z1'] = {
+    memoizedProps: {},
+    return: mid1,
+  };
+}
+
 /** 一个会话视图（结构照抄 Kiro 的产物）。 */
 interface View {
   root: El;
@@ -213,7 +234,18 @@ function timerTextOf(scope: El): string | null {
   return last && typeof last.nodeValue === 'string' ? last.nodeValue : null;
 }
 
-function boot(opts: { sessions?: string[]; noSessionViews?: boolean } = {}): Harness {
+function boot(
+  opts: {
+    sessions?: string[];
+    noSessionViews?: boolean;
+    /** 会话名 → sessionId（横条的 fiber 会报这个 id）。 */
+    ids?: Record<string, string>;
+    /** true = 横条上不挂 fiber，模拟 React 换了内部实现、身份解析失败。 */
+    noFiber?: boolean;
+    /** fiber 里 sessionId 的藏法：prop 或 per-session store。 */
+    fiberKind?: 'prop' | 'store';
+  } = {}
+): Harness {
   const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
   const byId = new Map<string, El>();
   const register = (el: El) => {
@@ -229,6 +261,9 @@ function boot(opts: { sessions?: string[]; noSessionViews?: boolean } = {}): Har
 
   const names = opts.noSessionViews ? [] : (opts.sessions ?? ['A']);
   const views: Record<string, View> = {};
+
+  /** 会话名 → sessionId：单会话用例用 's1'，多会话用 'sA' / 'sB'（与测试里的 prompt 对齐）。 */
+  const idOf = (n: string) => (opts.ids ?? {})[n] ?? (names.length === 1 ? 's1' : 's' + n);
 
   function buildView(name: string): View {
     const root = el('div');
@@ -255,6 +290,8 @@ function boot(opts: { sessions?: string[]; noSessionViews?: boolean } = {}): Har
         panel.className = 'agent-interaction-panel';
         const bar = el('div');
         bar.className = 'agent-interaction-panel-bottom-bar';
+        // 真实产物里横条的 fiber 能上溯到带 sessionId 的祖先
+        if (!opts.noFiber) attachFiber(bar, idOf(name), opts.fiberKind ?? 'prop');
         const left = el('div');
         const working = el('span');
         working.textContent = 'Working.';
@@ -386,7 +423,7 @@ describe('挂钩', () => {
   it('替换 window.vscode 成功，诊断对象就绪', () => {
     expect(h.diag.hooked).toBe(true);
     expect(h.diag.hookError).toBe('');
-    expect(h.diag.version).toBe(5);
+    expect(h.diag.version).toBe(6);
     expect(h.diag.running).toBe(0);
   });
 
@@ -553,7 +590,7 @@ describe('不串台（线上 bug 的回归钉子）', () => {
     expect(h.diag.reacquired).toBeGreaterThanOrEqual(1);
   });
 
-  it('重建后重新认领过一次，之后又能按会话子树精确配对（不再依赖启发式）', () => {
+  it('重建后把捕获的会话视图刷新成新那一棵（消息流兜底在重建后依然可用）', () => {
     const two = boot({ sessions: ['A', 'B'] });
     two.prompt('r1', 'sA');
     two.views.A.showBar();
@@ -569,6 +606,14 @@ describe('不串台（线上 bug 的回归钉子）', () => {
     two.advance(200);
     expect(two.diag.reacquired).toBe(after);
     expect(two.views.A.timerInBar()).toBe(true);
+
+    // 横条没了也能退回**自己**的消息流（而不是当前可见的那个）
+    two.views.A.hideBar();
+    two.views.A.setVisible(false);
+    two.views.B.setVisible(true);
+    two.advance(200);
+    two.advance(200);
+    expect(findTimer(two.views.B.content)).toBeNull();
   });
 
   it('切走时那个会话仍在跑、但视图还挂着（只是隐藏）→ 计时留在它自己的横条上', () => {
@@ -592,6 +637,57 @@ describe('不串台（线上 bug 的回归钉子）', () => {
     two.views.A.setVisible(true);
     two.advance(1_000);
     expect(two.views.A.timerText()).toBe('11s');
+  });
+
+  it('两个会话并行 + 视图都被重建：靠 fiber 精确认人，数字绝不配反', () => {
+    // 这一条是「宁可不显示也不显示错的」那个决定的正面版本：身份能精确解析时，
+    // 即使两棵视图都重建过、可见的那个不是先开始的那个，也必须各归各位。
+    const two = boot({ sessions: ['A', 'B'] });
+    two.prompt('r1', 'sA');
+    two.views.A.showBar();
+    two.advance(300_000); // A 已经跑了 5 分钟
+
+    two.views.A.setVisible(false);
+    two.views.B.setVisible(true);
+    two.prompt('r2', 'sB');
+    two.views.B.showBar();
+    two.advance(7_000); // B 才跑了 7 秒
+
+    // 两棵都重建（切换会话）——旧的启发式在这里会按「可见优先+最新优先」配，
+    // 于是可见的 B 会被配上最新的那一轮…看着对，但换个顺序就会配反。
+    two.remount('A', { withBar: true });
+    two.remount('B', { withBar: true });
+    two.advance(200);
+
+    expect(two.diag.running).toBe(2);
+    expect(two.diag.ambiguous).toBe(0);
+    expect(two.views.A.timerText()).toBe('5m 7s');
+    expect(two.views.B.timerText()).toBe('7s');
+  });
+
+  it('sessionId 藏在 per-session store 里也能认出来', () => {
+    const two = boot({ sessions: ['A', 'B'], fiberKind: 'store' });
+    two.prompt('r1', 'sA');
+    two.prompt('r2', 'sB');
+    two.views.A.showBar();
+    two.views.B.showBar();
+    two.advance(9_000);
+    expect(two.diag.ambiguous).toBe(0);
+    expect(two.views.A.timerText()).toBe('9s');
+    expect(two.views.B.timerText()).toBe('9s');
+  });
+
+  it('解析出的会话不在我们的轮记录里 → 这条横条不用（不是我们的，不往里写）', () => {
+    // 同一会话同时开在侧边栏和编辑器分栏、那一轮是另一边发起的：本 webview 看得到
+    // 它的横条，但没有它的轮记录。此时不能把别的轮的时间填进去。
+    const two = boot({ sessions: ['A', 'B'] });
+    two.prompt('r1', 'sA'); // 只有 A 这一轮是我们的
+    two.views.B.showBar(); // B 的横条由别处驱动
+    two.advance(1_000);
+
+    expect(two.views.B.timerText()).toBeNull();
+    // A 没有横条 → 退到 A 自己的消息流，而不是跑到 B 的横条里
+    expect(findTimer(two.views.A.content)).not.toBeNull();
   });
 
   it('会话视图被卸载（关掉那个会话）后不再显示，也不改挂到别处', () => {
@@ -755,6 +851,65 @@ describe('中断后重新提问（线上 bug 的回归钉子）', () => {
     h.receive({ type: 'response', id: 'r2', key: 'prompt', value: {} });
     expect(h.diag.running).toBe(0);
     expect(h.views.A.timerText()).toBeNull();
+  });
+});
+
+describe('身份解析失败时的兜底：宁可不显示，也不显示可能配反的数字', () => {
+  it('无歧义（一轮 + 一条横条）→ 照常显示', () => {
+    const one = boot({ noFiber: true });
+    one.prompt('r1');
+    one.views.A.showBar();
+    one.advance(200);
+    expect(one.views.A.timerInBar()).toBe(true);
+    expect(one.diag.fallbackPairs).toBeGreaterThanOrEqual(1);
+    expect(one.diag.fiberHits).toBe(0);
+  });
+
+  it('有歧义（两轮 + 两条身份不明的横条）→ 横条里一个都不写', () => {
+    const two = boot({ sessions: ['A', 'B'], noFiber: true });
+    two.prompt('r1', 'sA');
+    two.views.A.showBar();
+    two.prompt('r2', 'sB');
+    two.views.B.showBar();
+    two.advance(200);
+
+    expect(two.diag.ambiguous).toBeGreaterThanOrEqual(1);
+    expect(two.views.A.timerInBar()).toBe(false);
+    expect(two.views.B.timerInBar()).toBe(false);
+  });
+
+  it('有歧义时退到各自的消息流（仍然精确，因为那是发起时捕获的自己那棵）', () => {
+    const two = boot({ sessions: ['A', 'B'], noFiber: true });
+    two.prompt('r1', 'sA');
+    two.views.A.showBar();
+    two.views.A.setVisible(false);
+    two.views.B.setVisible(true);
+    two.prompt('r2', 'sB');
+    two.views.B.showBar();
+    two.advance(1_000); // 过了宽限期
+
+    // 每一行都在自己那棵视图里，没有互串
+    expect(findTimer(two.views.A.content)).not.toBeNull();
+    expect(findTimer(two.views.B.content)).not.toBeNull();
+    expect(two.views.A.timerText()).toBe('Elapsed time: 1s');
+  });
+
+  it('部分能解析：能认的精确配，剩下**恰好一条**才兜底配', () => {
+    const two = boot({ sessions: ['A', 'B'] });
+    two.prompt('r1', 'sA');
+    two.prompt('r2', 'sB');
+    two.views.A.showBar();
+    two.views.B.showBar();
+    // 把 B 的横条 fiber 摘掉，模拟只有一条认不出来
+    const barB = two.views.B.bar()!;
+    for (const k of Object.keys(barB)) {
+      if (k.indexOf('__reactFiber$') === 0) delete (barB as unknown as Record<string, unknown>)[k];
+    }
+    two.advance(3_000);
+
+    expect(two.views.A.timerText()).toBe('3s'); // fiber 精确
+    expect(two.views.B.timerText()).toBe('3s'); // 剩一轮剩一条 → 兜底也是唯一解
+    expect(two.diag.fallbackPairs).toBeGreaterThanOrEqual(1);
   });
 });
 
