@@ -61,6 +61,7 @@ interface El extends Nd {
   readonly lastChild: Nd | null;
   readonly firstElementChild: El | null;
   readonly lastElementChild: El | null;
+  readonly nextElementSibling: El | null;
 }
 
 /** 只支持 `.class` 选择器——脚本用到的就这一种。 */
@@ -133,6 +134,13 @@ function makeEl(tagName: string, onRegister?: (el: El) => void): El {
       const c = el.children;
       return c.length ? c[0] : null;
     },
+    get nextElementSibling() {
+      const p = el.parentElement;
+      if (!p) return null;
+      const sibs = p.children;
+      const i = sibs.indexOf(el);
+      return i >= 0 && i + 1 < sibs.length ? sibs[i + 1] : null;
+    },
     get lastElementChild() {
       const c = el.children;
       return c.length ? c[c.length - 1] : null;
@@ -156,6 +164,8 @@ interface View {
   timerText(): string | null;
   /** 该行是否落在横条里。 */
   timerInBar(): boolean;
+  /** 该会话当前的横条元素。 */
+  bar(): El | null;
 }
 
 interface Harness {
@@ -172,6 +182,14 @@ interface Harness {
   };
   views: Record<string, View>;
   body: El;
+  /**
+   * 模拟 Kiro 切换会话：把该会话视图整棵拆掉、再建一棵**全新的**。
+   *
+   * `SessionView` 渲染的是 `.session-view-root` > `.session-view-container`，
+   * 切换会话时这棵子树会被重建，元素身份全部改变——这正是「切走再切回后计时没了」
+   * 那个 bug 的成因。
+   */
+  remount(name: string, opts?: { withBar?: boolean }): void;
   /** 浮动兜底那行（挂在 body 上）的文字。 */
   floatingText(): string | null;
   ticking(): boolean;
@@ -212,7 +230,7 @@ function boot(opts: { sessions?: string[]; noSessionViews?: boolean } = {}): Har
   const names = opts.noSessionViews ? [] : (opts.sessions ?? ['A']);
   const views: Record<string, View> = {};
 
-  for (const name of names) {
+  function buildView(name: string): View {
     const root = el('div');
     root.className = 'session-view-root';
     const timeline = el('div');
@@ -258,7 +276,13 @@ function boot(opts: { sessions?: string[]; noSessionViews?: boolean } = {}): Har
         const bar = root.querySelector('.agent-interaction-panel-bottom-bar');
         return bar ? findTimer(bar) !== null : false;
       },
+      bar: () => root.querySelector('.agent-interaction-panel-bottom-bar'),
     };
+    return view;
+  }
+
+  for (const name of names) {
+    const view = buildView(name);
     // 默认第一个可见，其余隐藏（对应侧边栏的多会话形态）
     view.setVisible(name === names[0]);
     views[name] = view;
@@ -315,6 +339,15 @@ function boot(opts: { sessions?: string[]; noSessionViews?: boolean } = {}): Har
     diag: win.__kcsTurnTimer as Harness['diag'],
     views,
     body,
+    remount: (name, o = {}) => {
+      const old = views[name];
+      const wasVisible = old ? old.content.offsetParent !== null : true;
+      if (old && old.root.parentElement) old.root.parentElement.removeChild(old.root);
+      const fresh = buildView(name);
+      fresh.setVisible(wasVisible);
+      if (o.withBar) fresh.showBar();
+      views[name] = fresh;
+    },
     floatingText: () => {
       const row = body.children.find((c) => c.dataset && c.dataset.kcsLiveTurn === '1');
       return row ? timerTextOf(row.parentElement as El) : null;
@@ -353,7 +386,7 @@ describe('挂钩', () => {
   it('替换 window.vscode 成功，诊断对象就绪', () => {
     expect(h.diag.hooked).toBe(true);
     expect(h.diag.hookError).toBe('');
-    expect(h.diag.version).toBe(4);
+    expect(h.diag.version).toBe(5);
     expect(h.diag.running).toBe(0);
   });
 
@@ -407,18 +440,40 @@ describe('落在 "Working …" 横条里', () => {
     expect(h.diag.anchors).toEqual(['waiting']);
   });
 
-  it('React 在我们后面插了新节点 → 下一次刷新重新贴到末尾', () => {
+  it('计时是横条自己的 flex 项、插在 Cancel 之前，不会被挤到下一行', () => {
+    // 回归钉子：曾经插进左边那个格子里，而里面的 "Working" 是块级元素，
+    // 于是计时被换行显示。横条本身是 flex 容器，必须作为它的直接子项。
     h.prompt('r1');
     h.views.A.showBar();
     h.advance(200);
-    const bar = h.views.A.root.querySelector('.agent-interaction-panel-bottom-bar')!;
-    const left = bar.firstElementChild!;
-    const intruder = makeEl('span');
-    left.appendChild(intruder);
-    expect(left.lastElementChild).toBe(intruder);
 
+    const bar = h.views.A.bar()!;
+    const row = findTimer(bar)!;
+    const actions = bar.querySelector('.agent-interaction-panel-actions')!;
+    expect(row.parentElement).toBe(bar); // 直接子项，不在左边格子里
+    expect(row.nextElementSibling).toBe(actions); // 紧贴 Cancel 之前
+    expect(findTimer(bar.firstElementChild!)).toBeNull(); // 确实没塞进 "Working" 那格
+  });
+
+  it('React 在我们后面插了新节点 → 下一次刷新重新贴回 Cancel 之前', () => {
+    h.prompt('r1');
+    h.views.A.showBar();
     h.advance(200);
-    expect(left.lastElementChild!.dataset.kcsLiveTurn).toBe('1');
+    const bar = h.views.A.bar()!;
+    const actions = bar.querySelector('.agent-interaction-panel-actions')!;
+    bar.appendChild(makeEl('span')); // React 又插了个节点在最后
+    h.advance(200);
+    expect(findTimer(bar)!.nextElementSibling).toBe(actions);
+  });
+
+  it('位置已经对时不重复搬动 DOM（每 200ms 都动会让 React 白忙）', () => {
+    h.prompt('r1');
+    h.views.A.showBar();
+    h.advance(200);
+    const row = findTimer(h.views.A.bar()!)!;
+    h.advance(200);
+    h.advance(200);
+    expect(findTimer(h.views.A.bar()!)).toBe(row); // 还是同一个节点，没被重建
   });
 });
 
@@ -477,6 +532,66 @@ describe('不串台（线上 bug 的回归钉子）', () => {
     two.advance(1_000);
     expect(two.views.A.timerText()).toBeNull();
     expect(two.views.B.timerText()).toBe('5s');
+  });
+
+  it('切走再切回（会话视图被整棵重建）后，计时重新出现在新横条里', () => {
+    // 这是「切到 B 再切回 A，A 的横条上不显示计时了」那个 bug 的回归钉子：
+    // 切换会话会重建 .session-view-root 整棵子树，发起时记下的元素全部失效，
+    // 所以横条必须每次刷新都现查，而不能记住那个元素。
+    h.prompt('r1', 's1');
+    h.views.A.showBar();
+    h.advance(30_000);
+    expect(h.views.A.timerInBar()).toBe(true);
+
+    // 切到别的会话再切回来 → A 的会话视图是全新的元素（轮还在跑，横条也回来了）
+    h.remount('A', { withBar: true });
+    expect(h.views.A.timerInBar()).toBe(false); // 新子树里当然还没有我们的行
+
+    h.advance(200);
+    expect(h.views.A.timerInBar()).toBe(true);
+    expect(h.views.A.timerText()).toBe('30s'); // 起点没丢，仍是本轮的
+    expect(h.diag.reacquired).toBeGreaterThanOrEqual(1);
+  });
+
+  it('重建后重新认领过一次，之后又能按会话子树精确配对（不再依赖启发式）', () => {
+    const two = boot({ sessions: ['A', 'B'] });
+    two.prompt('r1', 'sA');
+    two.views.A.showBar();
+    two.advance(1_000);
+
+    two.remount('A', { withBar: true });
+    two.advance(200);
+    const after = two.diag.reacquired;
+    expect(after).toBeGreaterThanOrEqual(1);
+
+    // 再刷新几次不应继续重新认领——说明捕获的元素已经换成新那一棵了
+    two.advance(200);
+    two.advance(200);
+    expect(two.diag.reacquired).toBe(after);
+    expect(two.views.A.timerInBar()).toBe(true);
+  });
+
+  it('切走时那个会话仍在跑、但视图还挂着（只是隐藏）→ 计时留在它自己的横条上', () => {
+    // 另一种挂载模型：隐藏的会话视图留在 DOM 里。此时它的横条也还在，
+    // 计时留在那条不可见的横条上，切回来立刻看得见，且绝不出现在 B 里。
+    const two = boot({ sessions: ['A', 'B'] });
+    two.prompt('r1', 'sA');
+    two.views.A.showBar();
+    two.advance(200);
+
+    two.views.A.setVisible(false);
+    two.views.B.setVisible(true);
+    two.advance(10_000);
+
+    expect(two.views.A.timerInBar()).toBe(true);
+    expect(two.views.A.timerText()).toBe('10s');
+    expect(two.views.B.timerText()).toBeNull();
+
+    // 切回 A：同一条横条，数字接着走
+    two.views.B.setVisible(false);
+    two.views.A.setVisible(true);
+    two.advance(1_000);
+    expect(two.views.A.timerText()).toBe('11s');
   });
 
   it('会话视图被卸载（关掉那个会话）后不再显示，也不改挂到别处', () => {

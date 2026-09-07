@@ -30,7 +30,6 @@
  *
  * ── 点「停止」时那个 prompt 请求永远不会有响应 ─────────────────
  *
- * 这是本脚本 v2 的一个真实 bug（症状：中断后重新提问，新一轮跑完了计时还在涨）。
  * Kiro 的停止按钮做的是：
  *
  *     u.getState().cancelActivePrompt?.();   // 就地放弃自己那个 pending promise
@@ -40,43 +39,59 @@
  * 关键在 `cancelActivePrompt()`：Kiro **不等**被取消的那次 `prompt` 回响应，
  * 而是本地把 promise 了结掉。于是那个 requestId 的 `response` / `error`
  * **永远不会到达 webview**。Kiro 自己不受影响，因为它的 `isAgentActive` 是个
- * 布尔量、由**最新**那一轮覆盖写；而 v2 用的是「所有在途请求都清空才收工」，
- * 一个永远收不到响应的请求就把计时永久钉死，还因为取「最早」的开始时刻，
- * 显示的是被取消那一轮的起点（可以涨到好几个小时）。
+ * 布尔量、由**最新**那一轮覆盖写；而「所有在途请求都清空才收工」这种写法会被
+ * 一条永远收不到响应的记录永久钉死（曾经的真实 bug：中断后重新提问，新一轮跑完了
+ * 计时还在涨，且显示的是被取消那一轮的起点，能涨到好几个小时）。
  *
- * v3 因此改成和 Kiro 同构的模型：
+ * 所以记账与 Kiro 同构：
  *   1. **按 sessionId 记账，新的一轮顶掉旧的**——同一会话不可能有两轮并行，
  *      所以只要该会话又发了 `prompt`，先前那条无论结局如何都已作废。
  *   2. **`cancelPrompt` 当作该会话的轮结束**——这正是 Kiro 自己用的信号
  *      （紧跟着就是 `executionAborted` + `status:"aborted"`），也是唯一能
  *      在「响应永远不来」时正确收工的时机。
  *
- * ── 计时行显示在哪：一轮一行，且只在它自己的会话里 ─────────────
+ * ── 计时显示在哪：每轮一行，落在该会话自己的 "Working" 横条里 ──
  *
- * v2/v3 是**全局一行**，挂在「当前可见」的那个 `.session-view-content` 末尾。
- * 侧边栏的 `session-manager` 会为每个打开的会话各挂一份会话视图（只有当前那个
- * 可见），于是出现了第二个 bug：会话 A 在跑，切到没有任何活动的会话 B，
- * A 的计时行会跟着显示在 B 的消息流底部（「串台」）。
+ * 落点是 Kiro 的 `AgentInteractionPanel` 底部横条
+ * （`.agent-interaction-panel-bottom-bar`，就是对话框上方那条 "Working. … Cancel"）。
+ * 选它的理由不是位置好看：该组件在 `!children && !actions` 时**整个返回 `null`**，
+ * 所以**横条存在就等于这个会话有活动的轮**，天然一个会话一条。这也是翻遍产物后
+ * 唯一能把 DOM 与「哪个会话在跑」对应起来的信号——`.session-view-content` 上没有
+ * 任何 `data-session-*`，`data-active` / `data-incomplete` 都是弹出菜单和 markdown
+ * 流式渲染在用，与会话无关。
  *
- * v4 改成**一轮一行**，每行只出现在它自己那个会话视图的子树里。会话归属在
- * **发出 `prompt` 的那一刻**确定：那一刻正在可见的会话视图，必然就是用户刚敲下
- * 回车的那个。此后这一行只认捕获到的那棵子树，不再跟着「当前可见」跑。
- * 于是没有活动的会话什么都不显示，并行跑的多个会话各显示自己的耗时。
+ * 横条的 CSS 是 `display:flex; flex-wrap:wrap; justify-content:space-between`，
+ * 两个格子分别是「Working」和 `.agent-interaction-panel-actions`（Cancel）。
+ * 计时行要作为**横条自己的 flex 项**插在 actions 之前 ——
+ * 曾经插进左边那个格子里，而里面的 "Working" 是块级元素，于是计时被挤到了下一行。
  *
- * 位置优先级（同一轮内可以升级，但不会从 bar 退回消息流）：
- *   1. **`.agent-interaction-panel-bottom-bar`** —— 就是对话框上方那条
- *      "Working. … Cancel" 的横条。它是 Kiro 自己的 `AgentInteractionPanel`，
- *      `!children && !actions` 时整个组件返回 `null`，因此**它存在就等于这个会话
- *      有活动的轮**，天然一个会话一条，是最贴切的落点。
- *   2. 捕获到的那个 `.session-view-content` 末尾（Kiro 换了横条的类名时退到这里，
- *      仍然是**该会话自己的**消息流，不会串台）。
- *   3. 右下角浮动（连会话视图都没找到时的最后兜底，宁可位置怪也不要看不见）。
+ * ── 横条要每次现查，不能记住那个元素 ──────────────────────────
+ *
+ * 曾经的做法是在发出 `prompt` 的那一刻把会话视图的 DOM 记下来，之后只认这棵子树。
+ * 这在**切走再切回**时会崩：`session-manager` 切换会话会把会话视图整棵重建
+ * （`SessionView` 渲染的是 `.session-view-root` > `.session-view-container`，
+ * 切换后是全新的元素），于是记住的那些节点全部失效，计时就再也不显示了。
+ *
+ * 现在改成**每次刷新都重新在文档里找横条**，配对规则：
+ *   1. 先按会话子树精确配——捕获到的会话视图还活着时（没切过会话）恒走这条；
+ *   2. 剩下的（视图被重建过、记住的元素已失效）按「可见优先 + 最新优先」配上
+ *      剩下的横条，并**顺手把捕获的元素刷新成新的那一棵**，于是下一次又能走 1；
+ *   3. 一条横条都没有、而捕获到的会话视图还活着 → 退到该会话自己的消息流末尾
+ *      （Kiro 换了横条类名时的兜底，仍然不会串到别的会话去）；
+ *   4. 连会话视图都没捕获到 → 右下角浮动（最后兜底，宁可位置怪也不要看不见）。
+ *
+ * 这样两种挂载模型都成立：隐藏的会话视图**留在 DOM 里**时，它的横条也还在、
+ * 计时留在那条（不可见）横条上，切回来就看得见；被**整棵卸载**时，文档里根本没有
+ * 它的横条，于是什么都不显示——两种情况下空闲会话都不会莫名出现别人的计时。
  *
  * ── 已知边界 ──────────────────────────────────────────────────
- * - 面板在轮进行中被重建（切会话回来 / reload window）时，那次 `prompt`
- *   的请求不是本 webview 发的，起始时间无从得知，此时不显示计时（不猜）。
- * - 捕获到的会话视图被卸载（关掉那个会话）后不再显示该轮的计时：宁可不显示，
- *   也不要退回「当前可见」——那正是串台的来源。
+ * - 面板在轮进行中被重建（reload window）时，那次 `prompt` 的请求不是本 webview
+ *   发的，起始时间无从得知，此时不显示计时（不猜）。
+ * - **多个会话同时在跑**且它们的会话视图都被重建过时，横条与轮的配对退化成
+ *   「可见优先 + 最新优先」的启发式，可能把两个数字配反。单会话在跑（绝大多数
+ *   情形）没有这个问题。
+ * - 同一会话同时开在侧边栏和编辑器分栏、而那一轮是另一个 webview 发起的：本 webview
+ *   没有它的轮记录却能看到它的横条，此时可能把本 webview 某一轮的时间填进去。
  */
 
 (() => {
@@ -89,11 +104,13 @@
   const MARK = 'kcs-live-turn';
   const TICK_MS = 200;
 
-  /** Kiro 那条 "Working. … Cancel" 横条的容器类名。 */
+  /** Kiro 那条 "Working. … Cancel" 横条。 */
   const BAR_SELECTOR = '.agent-interaction-panel-bottom-bar';
-  /** 会话消息流（滚动容器）的类名。 */
+  /** 横条右侧的按钮组（Cancel 在里面）；计时插在它**之前**。 */
+  const ACTIONS_SELECTOR = '.agent-interaction-panel-actions';
+  /** 会话消息流（滚动容器）。 */
   const CONTENT_SELECTOR = '.session-view-content';
-  /** 会话视图输入区的类名，用来把消息流上溯到「会话视图根」。 */
+  /** 会话视图输入区，用来把任意节点上溯到「会话视图根」。 */
   const INPUT_SELECTOR = '.session-view-input';
 
   /**
@@ -114,7 +131,7 @@
    * `__kcsTurnTimer`——立刻知道钩子挂上了没、跑过几轮、每一行落在哪。
    */
   const diag = {
-    version: 4,
+    version: 5,
     /** 消息钩子是否已装上（false 则实时耗时一定不会出现）。 */
     hooked: false,
     /** 钩子装不上的原因。 */
@@ -125,8 +142,14 @@
     cancels: 0,
     /** 因同一会话又开新一轮而被顶掉的在途记录数（正常应为 0 或很小）。 */
     superseded: 0,
+    /** 会话视图被重建后重新认领横条的次数（切走再切回会 +1）。 */
+    reacquired: 0,
     /** 当前各行的落点：`bar` / `inline` / `floating` / `waiting` / `detached`。 */
     anchors: [],
+    /** 文档里当前有几条 "Working" 横条。 */
+    get bars() {
+      return collectBars().length;
+    },
     /** 正在跑的轮数。 */
     get running() {
       return turns.size;
@@ -144,14 +167,10 @@
    * 每条记录：
    *   `id`        对应的 prompt requestId
    *   `startedAt` 开始时刻(ms)
-   *   `content`   发起时可见的 `.session-view-content`（该会话的消息流）
-   *   `root`      该会话的会话视图根（含输入区的那个祖先）
+   *   `content`   该会话的消息流（发起时捕获，视图重建后会被刷新）
+   *   `root`      该会话的会话视图根（含输入区的那个祖先，同样会被刷新）
    *   `row/label` 这一轮自己的那行 DOM（按落点形态创建）
    *   `mode`      当前落点形态，用于形态变化时重建 DOM
-   *
-   * 按 **sessionId** 而不是 requestId 记账，是修 v2 那个 bug 的核心：同一会话不可能
-   * 有两轮并行，所以「该会话又发了 prompt」本身就是「上一条已作废」的确证——
-   * 不必依赖那条记录能否等到自己的响应（被取消的那条等不到，见文件头）。
    */
   const turns = new Map();
 
@@ -173,12 +192,12 @@
       detachRow(prev);
       diag.superseded += 1;
     }
-    const spot = captureAnchor();
+    const content = visibleContent();
     turns.set(sessionKey, {
       id: requestId,
       startedAt: Date.now(),
-      content: spot.content,
-      root: spot.root,
+      content: content,
+      root: content ? sessionRootOf(content) : null,
       row: null,
       label: null,
       mode: 'waiting',
@@ -230,10 +249,10 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 2. 会话归属：发出 prompt 的那一刻把会话视图记下来
+   * 2. DOM 定位
    * ------------------------------------------------------------------ */
 
-  /** 元素是否还挂在文档里（会话被关掉后它的子树会整棵摘走）。 */
+  /** 元素是否还挂在文档里（会话视图被重建/关闭后旧子树会整棵摘走）。 */
   function isAttached(el) {
     let cur = el;
     while (cur) {
@@ -243,79 +262,129 @@
     return false;
   }
 
+  /** 元素此刻是否可见（隐藏的会话视图里 `offsetParent` 为 null）。 */
+  function isVisible(el) {
+    return !!el && el.offsetParent !== null;
+  }
+
+  /** 文档里所有 "Working" 横条。 */
+  function collectBars() {
+    if (typeof document.querySelectorAll !== 'function') return [];
+    return [...document.querySelectorAll(BAR_SELECTOR)];
+  }
+
   /**
    * 当前可见的那个 `.session-view-content`。
-   *
-   * 一个 webview 里可能同时挂着多个会话视图（`session-manager` 为每个打开的会话各挂
-   * 一份），只有当前会话那个是可见的，用 `offsetParent` 过滤掉隐藏的。
    * 都不可见时退回最后一个（比什么都不给要好）。
    */
   function visibleContent() {
-    const all = document.querySelectorAll(CONTENT_SELECTOR);
-    for (let i = all.length - 1; i >= 0; i--) {
-      if (all[i].offsetParent !== null) return all[i];
-    }
+    if (typeof document.querySelectorAll !== 'function') return null;
+    const all = [...document.querySelectorAll(CONTENT_SELECTOR)];
+    for (let i = all.length - 1; i >= 0; i--) if (isVisible(all[i])) return all[i];
     return all.length > 0 ? all[all.length - 1] : null;
   }
 
   /**
-   * 从消息流上溯到「会话视图根」：最近的、**同时含有输入区**的那个祖先。
+   * 从任意节点上溯到「会话视图根」：最近的、**同时含有输入区**的那个祖先。
    *
    * 用「含有输入区」而不是写死层数，是因为层级是 minified 产物的实现细节；
    * 而「消息流和输入框属于同一个会话视图」这件事是结构性的，不会随改版轻易变。
-   * 找到根之后，那条 "Working" 横条就在这棵子树里，与别的会话不会混。
    */
-  function sessionRootOf(content) {
-    let el = content ? content.parentElement : null;
-    for (let i = 0; i < 6 && el; i++) {
-      if (typeof el.querySelector === 'function' && el.querySelector(INPUT_SELECTOR)) return el;
-      el = el.parentElement;
+  function sessionRootOf(el) {
+    let cur = el ? el.parentElement : null;
+    for (let i = 0; i < 8 && cur; i++) {
+      if (typeof cur.querySelector === 'function' && cur.querySelector(INPUT_SELECTOR)) return cur;
+      cur = cur.parentElement;
     }
     return null;
   }
 
-  /** 发起时刻的会话归属快照。 */
-  function captureAnchor() {
-    const content = visibleContent();
-    return { content: content || null, root: content ? sessionRootOf(content) : null };
-  }
+  /**
+   * 给每一轮配一条横条。
+   *
+   * 两轮配对，顺序有讲究：
+   *   1. **按会话子树精确配**：捕获到的会话视图还活着（没切过会话），
+   *      那么它子树里的横条一定就是这一轮的，不存在猜错。
+   *   2. 剩下的按「**可见优先 + 最新优先**」配剩下的横条：会话视图被重建过之后
+   *      记住的元素全失效了，只能启发式——而用户正看着的那条横条，最可能属于
+   *      最近发起的那一轮。配上之后会**刷新捕获的元素**，于是下一次又能走 1。
+   */
+  function resolveBars() {
+    const map = new Map();
+    if (turns.size === 0) return map;
+    const all = collectBars();
+    if (all.length === 0) return map;
 
-  /* ------------------------------------------------------------------ *
-   * 3. 落点决策
-   * ------------------------------------------------------------------ */
+    const used = new Set();
+    for (const turn of turns.values()) {
+      const root = turn.root && isAttached(turn.root) ? turn.root : null;
+      if (!root || typeof root.querySelector !== 'function') continue;
+      const bar = root.querySelector(BAR_SELECTOR);
+      if (bar && !used.has(bar)) {
+        map.set(turn, bar);
+        used.add(bar);
+      }
+    }
+
+    const orphans = [...turns.values()]
+      .filter((t) => !map.has(t))
+      .sort((a, b) => b.startedAt - a.startedAt);
+    if (orphans.length === 0) return map;
+
+    const free = all
+      .filter((b) => !used.has(b))
+      .sort((a, b) => (isVisible(a) ? 0 : 1) - (isVisible(b) ? 0 : 1));
+
+    for (let i = 0; i < orphans.length && i < free.length; i++) {
+      const turn = orphans[i];
+      map.set(turn, free[i]);
+      // 重新认领：把捕获的元素换成新那一棵，下次就能走精确配对
+      const root = sessionRootOf(free[i]);
+      if (root && root !== turn.root) {
+        turn.root = root;
+        const content = typeof root.querySelector === 'function' ? root.querySelector(CONTENT_SELECTOR) : null;
+        if (content) turn.content = content;
+        diag.reacquired += 1;
+      }
+    }
+    return map;
+  }
 
   /**
    * 这一轮的计时该放哪。
    *
-   * 返回 `{ target, mode }`；`mode === 'waiting'` 表示这一刻先别显示
-   * （还在等横条渲染出来）；返回 `null` 表示该轮的会话视图已经不在了，
-   * **不显示**——退回「当前可见」就是串台的来源，所以这里宁可不显示。
+   * 返回 `{ target, before, mode }`；`mode === 'waiting'` 表示这一刻先别显示；
+   * 返回 `null` 表示这一轮已经无处可放（会话被关掉了），**不显示**——
+   * 退回「当前可见的那个会话」就是串台的来源。
    */
-  function anchorFor(turn, now) {
-    const root = turn.root && isAttached(turn.root) ? turn.root : null;
-    const content = turn.content && isAttached(turn.content) ? turn.content : null;
-
-    // 捕获过会话视图、但它已经不在文档里 ⇒ 那个会话被关掉了，这一轮不会再有落点。
-    // 这一步必须在别的判断**之前**：否则「已经进了横条」那条会把它误报成 waiting，
-    // 而 waiting 是「等一下就好」的意思，掩盖了「永远不会再显示」这个事实。
-    if ((turn.root || turn.content) && !root && !content) return null;
-
-    // 1. 该会话自己的 "Working …" 横条
-    const bar = findBar(root);
-    if (bar) return { target: bar.firstElementChild || bar, mode: 'bar' };
-
-    // 已经进了横条又找不到它了 ⇒ 这一轮正在收尾，不要再跳回消息流闪一下
-    if (turn.mode === 'bar') return { target: null, mode: 'waiting' };
-
-    // 2. 还在宽限期内就等一等，避免「先落消息流、再跳进横条」的闪动
-    if ((root || content) && now - turn.startedAt < BAR_GRACE_MS) {
-      return { target: null, mode: 'waiting' };
+  function anchorFor(turn, bar, now) {
+    if (bar) {
+      // 插在 Cancel 那组按钮之前，作为横条自己的 flex 项（不能塞进左边格子里，
+      // 那里的 "Working" 是块级元素，会把计时挤到下一行）
+      const actions = typeof bar.querySelector === 'function' ? bar.querySelector(ACTIONS_SELECTOR) : null;
+      return { target: bar, before: actions && actions.parentElement === bar ? actions : null, mode: 'bar' };
     }
 
-    // 3. 退到该会话自己的消息流末尾（注意用捕获到的那个，不是当前可见的那个）
-    if (content) return { target: content, mode: 'inline' };
+    const rootAlive = !!(turn.root && isAttached(turn.root));
+    const contentAlive = !!(turn.content && isAttached(turn.content));
 
-    // 4. 连会话视图都没捕获到：右下角浮动，宁可位置怪也不要看不见
+    // 已经进过横条、视图还活着而横条没了 ⇒ 这一轮正在收尾，别跳回消息流闪一下
+    if (turn.mode === 'bar' && (rootAlive || contentAlive)) {
+      return { target: null, before: null, mode: 'waiting' };
+    }
+
+    // 捕获过会话视图，但它整棵都不在了、也没配到横条 ⇒ 那个会话被关掉了
+    if ((turn.root || turn.content) && !rootAlive && !contentAlive) return null;
+
+    // 还在宽限期内就等一等，避免「先落消息流、再跳进横条」的闪动
+    if ((rootAlive || contentAlive) && now - turn.startedAt < BAR_GRACE_MS) {
+      return { target: null, before: null, mode: 'waiting' };
+    }
+
+    // 退到该会话自己的消息流末尾（用捕获到的那个，不是当前可见的那个）
+    if (contentAlive) return { target: turn.content, before: null, mode: 'inline' };
+
+    // 连会话视图都没捕获到：右下角浮动
     if (!turn.root && !turn.content && document.body) {
       if (!warnedFloating) {
         warnedFloating = true;
@@ -324,32 +393,14 @@
             'Kiro 对话面板的 DOM 结构可能变了，锚点需要更新。'
         );
       }
-      return { target: document.body, mode: 'floating' };
+      return { target: document.body, before: null, mode: 'floating' };
     }
 
-    return null;
-  }
-
-  /**
-   * 找 "Working …" 横条。
-   *
-   * 优先在该会话子树里找；上溯不到会话视图根时，**只有单轮在跑**才允许全文档找
-   * ——此时全文档最多一条横条，不存在认错会话的风险。多轮并行又定不到根，就不猜。
-   */
-  function findBar(root) {
-    if (root && typeof root.querySelector === 'function') {
-      const scoped = root.querySelector(BAR_SELECTOR);
-      if (scoped) return scoped;
-      return null;
-    }
-    if (turns.size === 1 && typeof document.querySelector === 'function') {
-      return document.querySelector(BAR_SELECTOR);
-    }
     return null;
   }
 
   /* ------------------------------------------------------------------ *
-   * 4. 渲染
+   * 3. 渲染
    * ------------------------------------------------------------------ */
 
   /**
@@ -372,9 +423,10 @@
         background: currentColor;
         vertical-align: baseline;
       }
-      /* 落在 "Working …" 横条里：跟着横条的字号与颜色，只与前文留一点间距 */
+      /* 横条里：作为它自己的 flex 项，不参与拉伸也不换行（横条本身有 gap，不用外边距） */
       .${MARK}.${MARK}--bar {
-        margin-inline-start: 8px;
+        flex: 0 0 auto;
+        white-space: nowrap;
         font-variant-numeric: tabular-nums;
         opacity: .85;
       }
@@ -401,9 +453,9 @@
   }
 
   /**
-   * 造一行计时 DOM。形态决定标签结构：
+   * 造一行计时 DOM。形态决定结构：
    *
-   * - `bar`：一个轻量 `<span>`，挂进横条里跟在 "Working." 后面，不带任何块级样式。
+   * - `bar`：一个轻量 `<span>`，作为横条的 flex 项插在 Cancel 之前。
    * - 其余：复用 Kiro footer 的类名 `kiro-turn-usage-summary` / `-left` / `-item`，
    *   于是间距、字号、颜色都跟原生那行一模一样，不引入新的视觉规范。
    *
@@ -449,6 +501,22 @@
   }
 
   /**
+   * 把行放到位（幂等）：位置已经对就什么都不做。
+   *
+   * 幂等很要紧——每 200ms 都会调一次，每次都动 DOM 会让 React 白忙，
+   * 也会在横条里造成不必要的重排。
+   */
+  function place(row, target, before) {
+    if (before) {
+      if (row.parentElement !== target || row.nextElementSibling !== before) {
+        target.insertBefore(row, before);
+      }
+      return;
+    }
+    if (target.lastElementChild !== row) target.appendChild(row);
+  }
+
+  /**
    * 时长格式化：与 Kiro 自带 PromptTurnFooter 的 formatDuration 同规则
    * （"1h 2m 3s"，各段为 0 时省略，全为 0 时显示 "0s"），
    * 这样进行中和结束后的文字风格一致，不会有割裂感。
@@ -468,28 +536,27 @@
   /**
    * 刷新所有在跑的轮。
    *
-   * 每 200ms 跑一遍，顺带承担「重新贴到末尾」的职责：React 只操作它自己创建的节点，
-   * 不会删掉我们这个外来子节点，但**可能**在我们后面再插入新节点。用定时刷新去重锚
-   * （而不是 MutationObserver）少一个观察者、也避免「我们改 DOM → 观察者又被触发」
-   * 这种自激循环；200ms 的滞后在视觉上察觉不到。
+   * 每 200ms 跑一遍，顺带承担两件事：**重新找横条**（会话视图被重建后靠这个恢复）
+   * 与**重新贴到位**（React 可能在我们后面又插了节点）。用定时刷新而不是
+   * MutationObserver：少一个观察者，也避免「我们改 DOM → 观察者又被触发」这种
+   * 自激循环；200ms 的滞后在视觉上察觉不到。
    */
   function paint() {
     if (turns.size === 0) return;
     const now = Date.now();
+    const bars = resolveBars();
     const anchors = [];
 
     for (const turn of turns.values()) {
-      const spot = anchorFor(turn, now);
+      const spot = anchorFor(turn, bars.get(turn), now);
 
       if (!spot) {
-        // 会话视图没了：摘掉这一行，且不去猜别的位置
         detachRow(turn);
         anchors.push('detached');
         continue;
       }
 
       if (!spot.target) {
-        // 还在等横条：先不显示，但别把已有的那行留在错的地方
         if (turn.mode !== spot.mode) detachRow(turn);
         anchors.push('waiting');
         continue;
@@ -504,7 +571,7 @@
         turn.mode = spot.mode;
       }
 
-      if (spot.target.lastElementChild !== turn.row) spot.target.appendChild(turn.row);
+      place(turn.row, spot.target, spot.before);
 
       const elapsed = formatDuration(now - turn.startedAt);
       // 横条里已经有 "Working." 在交代「在干什么」，不必再重复 "Elapsed time"
@@ -531,7 +598,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 5. 出向：认出 `prompt` 请求 = 轮开始
+   * 4. 出向：认出 `prompt` 请求 = 轮开始
    *
    * ── 为什么是「替换 window.vscode」而不是「包一层 postMessage」 ──────────
    *
@@ -560,7 +627,7 @@
       if (message.type !== 'request' || typeof message.id !== 'string') return;
 
       if (message.key === 'prompt') {
-        // 拿不到 sessionId 时退化成按 requestId 记账：至少不比 v2 差
+        // 拿不到 sessionId 时退化成按 requestId 记账
         const sid = sessionIdOf(message.params) || 'kcs-req:' + message.id;
         startTurn(sid, message.id);
         diag.turns += 1;
@@ -623,7 +690,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 6. 入向：response / error 落到在途 id 上 = 轮结束
+   * 5. 入向：response / error 落到在途 id 上 = 轮结束
    * ------------------------------------------------------------------ */
   window.addEventListener('message', (event) => {
     const data = event.data;

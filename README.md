@@ -185,21 +185,49 @@ Kiro 自带的对话面板**只在一轮结束后**才显示 `Elapsed time`（�
 
 入口：搜索面板过滤条**右下角的齿轮**，或命令 `Kiro: 对话搜索设置`（`kiroChatSearch.settings`）。
 
-### 计时显示在哪：一轮一行，且只在它自己的会话里
+### 计时显示在哪：每轮一行，落在该会话自己的 "Working" 横条里
 
-落点优先 **`.agent-interaction-panel-bottom-bar`** —— 就是 `Working. … Cancel` 那条横条。
+落点是 **`.agent-interaction-panel-bottom-bar`** —— 就是 `Working. … Cancel` 那条横条。
 选它的理由不是位置好看：Kiro 的 `AgentInteractionPanel` 在 `!children && !actions` 时
-整个组件返回 `null`，所以**它存在就等于这个会话有活动的轮**，天然一个会话一条，
-是这个信息唯一恰当的落点。横条不在（Kiro 换了类名）时退到该会话自己的消息流末尾，
-连会话视图都找不到才右下角浮动。
+整个组件返回 `null`，所以**它存在就等于这个会话有活动的轮**，天然一个会话一条。
+这也是翻遍产物后唯一能把 DOM 与「哪个会话在跑」对应起来的信号——`.session-view-content`
+上没有任何 `data-session-*`，`data-active` / `data-incomplete` 都是弹出菜单和 markdown
+流式渲染在用，与会话无关。
 
-会话归属在**发出 `prompt` 的那一刻**确定：那一刻正在可见的会话视图，必然就是用户刚敲下
-回车的那个。此后这一行只认捕获到的那棵子树，不再跟着「当前可见」跑。于是没有活动的会话
-什么都不显示，并行跑的多个会话各显示自己的耗时。
+计时行必须作为**横条自己的 flex 项**插在 `.agent-interaction-panel-actions`（Cancel）之前：
 
-> 这里修掉的是一个真实 bug：早先版本只有**全局一行**、挂在「当前可见」的消息流末尾。
+```css
+.agent-interaction-panel-bottom-bar { display:flex; flex-wrap:wrap; justify-content:space-between }
+```
+
+> 曾经插进左边那个格子里，而里面的 "Working" 是块级元素，于是计时被挤到了下一行。
+
+#### 横条要每次现查，不能记住那个元素
+
+早先的做法是在发出 `prompt` 的那一刻把会话视图的 DOM 记下来，之后只认这棵子树。
+这在**切走再切回**时会崩：`session-manager` 切换会话会把 `SessionView` 渲染的
+`.session-view-root` > `.session-view-container` 整棵重建，记住的节点全部失效，
+计时就再也不显示了。
+
+现在每次刷新（200ms）都重新在文档里找横条，配对分两轮：
+
+1. **按会话子树精确配**——捕获到的会话视图还活着时（没切过会话）恒走这条，不存在猜错；
+2. 剩下的按「**可见优先 + 最新优先**」配上剩下的横条，并顺手把捕获的元素**刷新成新的
+   那一棵**，于是下一次又能走 1（`__kcsTurnTimer.reacquired` 会 +1）；
+3. 一条横条都没有、而捕获到的会话视图还活着 → 退到该会话自己的消息流末尾（Kiro 换了
+   横条类名时的兜底，仍然不会串到别的会话去）；
+4. 连会话视图都没捕获到 → 右下角浮动。
+
+这样两种挂载模型都成立：隐藏的会话视图**留在 DOM 里**时，它的横条也还在，计时留在那条
+（不可见的）横条上，切回来就看得见；被**整棵卸载**时文档里根本没有它的横条，于是什么都
+不显示。两种情况下空闲会话都不会莫名出现别人的计时。
+
+> 这里修掉的是一个真实 bug：更早的版本只有**全局一行**、挂在「当前可见」的消息流末尾。
 > 侧边栏的 `session-manager` 会为每个打开的会话各挂一份会话视图（只有当前那个可见），
 > 于是会话 A 在跑、切到空闲的会话 B，A 的计时会跟着显示在 B 的消息流里（串台）。
+
+已知边界：**多个会话同时在跑**且它们的会话视图都被重建过时，横条与轮的配对退化成
+「可见优先 + 最新优先」的启发式，可能把两个数字配反；单会话在跑没有这个问题。
 
 ### 点「停止」时，那个 prompt 请求永远不会有响应
 
@@ -221,10 +249,18 @@ promise 了结掉，那个 requestId 的 `response`/`error` **永远不会到达
 因此记账改成与 Kiro 同构：按 `sessionId` 记账（同一会话不可能两轮并行，新的一轮直接顶掉
 旧记录），并把 `cancelPrompt` 本身当作该会话的轮结束。
 
+### 测试
+
 `media/kcs-turn-timer.js` 是整个扩展唯一跑在别人 webview 里的代码，出问题时从扩展侧看不到
-任何东西，所以 `tests/turnTimer.script.spec.ts` 把**真实发布的那份文件**放进 DOM 替身里执行、
-用 postMessage 序列驱动它（25 条）。上面两个 bug 各有一组回归钉子；把脚本换回出 bug 的版本
-（`KCS_TURN_TIMER_SCRIPT` 环境变量可指向别的副本）会红 19 条，即这些断言确实抓得住。
+任何东西（拿不到 DOM、控制台不落盘）。所以 `tests/turnTimer.script.spec.ts` 把**真实发布的
+那份文件**放进 DOM 替身里执行（结构照抄 Kiro 的产物：`.session-view-root` >
+`.session-view-container` > `.session-view-timeline` > `.session-view-content`、
+`.agent-interaction-panel`、`.session-view-input`），用 postMessage 序列驱动它，
+并能模拟「切换会话 = 整棵重建」。共 30 条，上面每个 bug 都有一组回归钉子。
+
+这些断言不是只对当前实现自说自话：`SCRIPT_PATH` 支持用环境变量 `KCS_TURN_TIMER_SCRIPT`
+指向别的副本，把它指到出过 bug 的历史版本会红——「所有在途请求都收到响应才收工」那版红 19 条，
+「记住会话视图元素」那版红 4 条（换行落点 2 条 + 切走再切回 2 条）。
 
 ### 为什么需要打补丁
 
