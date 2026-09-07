@@ -180,9 +180,51 @@ Kiro 从 0.9x 升级到 1.x 后聊天历史的磁盘布局被整体重写。本�
 
 Kiro 自带的对话面板**只在一轮结束后**才显示 `Elapsed time`（数据来自 `messages.jsonl`
 的 `usage_summary.elapsedTime`）。AI 还在输出时没有任何耗时显示。本扩展补上这段空窗：
-开启后，消息流底部会实时显示本轮已耗时，一轮结束即消失、交回 Kiro 原生那一行。
+开启后，对话框上方那条 `Working. … Cancel` 横条里会实时显示本轮已耗时，一轮结束即消失、
+交回 Kiro 原生那一行。
 
 入口：搜索面板过滤条**右下角的齿轮**，或命令 `Kiro: 对话搜索设置`（`kiroChatSearch.settings`）。
+
+### 计时显示在哪：一轮一行，且只在它自己的会话里
+
+落点优先 **`.agent-interaction-panel-bottom-bar`** —— 就是 `Working. … Cancel` 那条横条。
+选它的理由不是位置好看：Kiro 的 `AgentInteractionPanel` 在 `!children && !actions` 时
+整个组件返回 `null`，所以**它存在就等于这个会话有活动的轮**，天然一个会话一条，
+是这个信息唯一恰当的落点。横条不在（Kiro 换了类名）时退到该会话自己的消息流末尾，
+连会话视图都找不到才右下角浮动。
+
+会话归属在**发出 `prompt` 的那一刻**确定：那一刻正在可见的会话视图，必然就是用户刚敲下
+回车的那个。此后这一行只认捕获到的那棵子树，不再跟着「当前可见」跑。于是没有活动的会话
+什么都不显示，并行跑的多个会话各显示自己的耗时。
+
+> 这里修掉的是一个真实 bug：早先版本只有**全局一行**、挂在「当前可见」的消息流末尾。
+> 侧边栏的 `session-manager` 会为每个打开的会话各挂一份会话视图（只有当前那个可见），
+> 于是会话 A 在跑、切到空闲的会话 B，A 的计时会跟着显示在 B 的消息流里（串台）。
+
+### 点「停止」时，那个 prompt 请求永远不会有响应
+
+轮的起止靠观测 RPC：`{type:'request',key:'prompt'}` 发出 = 轮开始，同 id 的
+`response`/`error` 回来 = 轮结束。但**点停止是个例外**，Kiro 的停止按钮做的是：
+
+```js
+u.getState().cancelActivePrompt?.();   // 就地放弃自己那个 pending promise
+c("cancelPrompt", sessionId);          // 再通知扩展去 cancel
+…随后（若是「中断并重新提问」）await c("prompt", {…}) 开新一轮
+```
+
+关键在 `cancelActivePrompt()`：Kiro **不等**被取消的那次 `prompt` 回响应，而是本地把
+promise 了结掉，那个 requestId 的 `response`/`error` **永远不会到达 webview**。Kiro 自己
+不受影响（`isAgentActive` 是布尔量、由最新那一轮覆盖写），但「所有在途请求都收到响应才
+停止计时」这种写法会被永久钉死——这正是另一个真实 bug 的成因：中断后重新提问，新一轮
+跑完了计时还在涨，而且显示的是**被取消那一轮**的起点，能涨到好几个小时。
+
+因此记账改成与 Kiro 同构：按 `sessionId` 记账（同一会话不可能两轮并行，新的一轮直接顶掉
+旧记录），并把 `cancelPrompt` 本身当作该会话的轮结束。
+
+`media/kcs-turn-timer.js` 是整个扩展唯一跑在别人 webview 里的代码，出问题时从扩展侧看不到
+任何东西，所以 `tests/turnTimer.script.spec.ts` 把**真实发布的那份文件**放进 DOM 替身里执行、
+用 postMessage 序列驱动它（25 条）。上面两个 bug 各有一组回归钉子；把脚本换回出 bug 的版本
+（`KCS_TURN_TIMER_SCRIPT` 环境变量可指向别的副本）会红 19 条，即这些断言确实抓得住。
 
 ### 为什么需要打补丁
 
@@ -698,7 +740,7 @@ src/
   webview/turnTimer.ts # 设置页状态行文案的纯函数（turnTimerStatusLabel）
   webview/marks.ts    # 提醒标记的归一化与标题预览（normalizeMark / markPreview，宿主与设置页共用）
 media/
-  kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）
+  kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）；由 tests/turnTimer.script.spec.ts 直接驱动
   telemetryTap.ts     # 只读诊断：进程边界与 OTel 全局注册表探查（取真实 token 的可行性）
 tests/                # vitest 单元测试与 fast-check 属性测试
 docs/
