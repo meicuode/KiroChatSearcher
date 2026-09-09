@@ -5,6 +5,7 @@ import {
   isTitleMarked,
   markTitle,
   normalizeMark,
+  mostRecentPending,
   scanPendingInteractions,
   scanSessionActivity,
   stripAnyMark,
@@ -575,5 +576,156 @@ describe('AttentionWatcher - 标题同步', () => {
     await w.dispose();
     expect(writes[1]).toBeUndefined();
     expect(w.pending).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 状态栏按钮的跳转目标
+ *
+ * 「待确认」那个按钮点下去要直接打开对应会话，于是需要两件此前没有的东西：
+ * 等待项得带上**会话身份**（解析阶段拿不到，只能在枚举目录时盖上），
+ * 以及多个会话同时在等时**挑哪一个**的规则。
+ * ------------------------------------------------------------------ */
+
+/** 造一条带指定时间戳的 pending 行。 */
+const pendingAt = (id: string, timestamp: string, question = 'Run command') =>
+  line(
+    { type: 'pending_interaction', interactionType: 'tool_approval', toolCallId: id, question },
+    timestamp
+  );
+
+/** 造一条带指定 id 的 turn_end 行（默认的 turnEndLine 恒用同一个 id，比不出「又跑完一轮」）。 */
+const turnEndWithId = (eventId: string) =>
+  JSON.stringify({
+    id: eventId,
+    timestamp: '2026-09-03T02:00:00.000Z',
+    payload: { type: 'turn_end', stopReason: 'end_turn' },
+  });
+
+describe('mostRecentPending - 挑最近一个等待项', () => {
+  const at = (ms: number | null): PendingInteraction => ({
+    toolCallId: 't' + String(ms),
+    interactionType: 'tool_approval',
+    question: '',
+    at: ms,
+  });
+
+  it('空数组返回 null', () => {
+    expect(mostRecentPending([])).toBeNull();
+  });
+
+  it('取时间戳最新的那条，与数组顺序无关', () => {
+    expect(mostRecentPending([at(100), at(300), at(200)])?.at).toBe(300);
+    expect(mostRecentPending([at(300), at(100)])?.at).toBe(300);
+  });
+
+  it('带时间戳的优先于不带的', () => {
+    expect(mostRecentPending([at(null), at(50)])?.at).toBe(50);
+    expect(mostRecentPending([at(50), at(null)])?.at).toBe(50);
+  });
+
+  it('都不带时间戳时取靠后那条（文件里出现得更晚 = 更近）', () => {
+    const items = [at(null), at(null)];
+    expect(mostRecentPending(items)).toBe(items[1]);
+  });
+
+  it('时间戳相同时取靠后那条', () => {
+    const items = [at(100), at(100)];
+    expect(mostRecentPending(items)).toBe(items[1]);
+  });
+});
+
+describe('AttentionWatcher - 会话身份与跳转目标', () => {
+  it('等待项带上所在目录名作为 sessionId', async () => {
+    const { deps } = makeDeps({ files: { 'sess-a/messages.jsonl': pendingLine('t1', 'Q') } });
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh();
+    expect(w.pending).toHaveLength(1);
+    expect(w.pending[0].sessionId).toBe('sess-a');
+  });
+
+  it('多个会话在等 → focusSessionId 是事件时间最新那条所在的会话', async () => {
+    const { deps } = makeDeps({
+      files: {
+        'sess-old/messages.jsonl': pendingAt('t1', '2026-09-03T01:00:00.000Z'),
+        'sess-new/messages.jsonl': pendingAt('t2', '2026-09-03T05:00:00.000Z'),
+      },
+    });
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh();
+    expect(w.pending).toHaveLength(2);
+    expect(w.focusSessionId).toBe('sess-new');
+  });
+
+  it('没有任何等待项也没跑完过 → 没有跳转目标', async () => {
+    const { deps } = makeDeps({
+      files: { 's1/messages.jsonl': [pendingLine('t1'), resolvedLine('t1')].join('\n') },
+    });
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh();
+    expect(w.focusSessionId).toBeUndefined();
+    expect(w.doneSessionId).toBeUndefined();
+  });
+
+  it('跑完一轮 → doneSessionId 指向那个会话，并随状态一起下发', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': turnEndWithId('turn-1') };
+    const { deps, states } = makeDeps({ files });
+    // readTail 按 files 现取，改内容即可模拟「又跑完一轮」
+    (deps as unknown as { readTail: (f: string) => string | null }).readTail = () =>
+      files['s1/messages.jsonl'];
+
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh(); // 首次只建基线
+    expect(w.hasDone).toBe(false);
+
+    files['s1/messages.jsonl'] = turnEndWithId('turn-2');
+    await w.refresh();
+
+    expect(w.hasDone).toBe(true);
+    expect(w.doneSessionId).toBe('s1');
+    expect(w.focusSessionId).toBe('s1');
+    expect(states[states.length - 1].done).toBe(true);
+  });
+
+  it('待确认优先于已完成：两者并存时跳转目标是待确认那个会话', async () => {
+    const files: Record<string, string> = {
+      'sess-done/messages.jsonl': turnEndWithId('turn-1'),
+      'sess-wait/messages.jsonl': '',
+    };
+    const { deps } = makeDeps({ files });
+    (deps as unknown as { readTail: (f: string) => string | null }).readTail = (f: string) => {
+      const key = Object.keys(files).find((k) => f.replace(/\\/g, '/').includes('/' + k));
+      return key === undefined ? null : files[key];
+    };
+
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh(); // 基线
+
+    files['sess-done/messages.jsonl'] = turnEndWithId('turn-2');
+    files['sess-wait/messages.jsonl'] = pendingLine('t1', '要不要执行');
+    await w.refresh();
+
+    expect(w.hasDone).toBe(true);
+    expect(w.doneSessionId).toBe('sess-done');
+    // 卡着等你点的那个优先——与状态栏上显示的文字同一优先级
+    expect(w.focusSessionId).toBe('sess-wait');
+  });
+
+  it('窗口获得焦点后完成态清空，跳转目标也一并消失', async () => {
+    const files: Record<string, string> = { 's1/messages.jsonl': turnEndWithId('turn-1') };
+    const { deps } = makeDeps({ files });
+    (deps as unknown as { readTail: () => string | null }).readTail = () =>
+      files['s1/messages.jsonl'];
+
+    const w = new AttentionWatcher(deps, MARK);
+    await w.refresh();
+    files['s1/messages.jsonl'] = turnEndWithId('turn-2');
+    await w.refresh();
+    expect(w.focusSessionId).toBe('s1');
+
+    await w.onWindowFocused();
+    expect(w.hasDone).toBe(false);
+    expect(w.doneSessionId).toBeUndefined();
+    expect(w.focusSessionId).toBeUndefined();
   });
 });

@@ -46,6 +46,7 @@ import {
   type TurnTimerOptions,
   type TurnTimerStatus,
 } from './turnTimer';
+import { readNewSessionMeta } from './session/newFormat';
 import { encodeWorkspaceKeys, getKiroUserDataDir } from './paths';
 import { dropArchiveEntries, listArchiveEntries, workspaceIdCandidates } from './credits';
 import { formatSize } from './webview/size';
@@ -362,9 +363,54 @@ function getAttentionStatusBar(): vscode.StatusBarItem {
   if (!attentionStatusBar) {
     // 靠左、优先级高：等待确认是「现在就该看一眼」的信息，不该被挤到右边一堆项里
     attentionStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
-    attentionStatusBar.command = 'kiroChatSearch.toggleView';
+    // 点击 = 直接打开那个会话。此前是切换搜索侧边栏，那和「谁在等我确认」毫无关系：
+    // 用户看到提示后要做的事就是去处理它，按钮该把他送到那儿。
+    attentionStatusBar.command = 'kiroChatSearch.openAttentionSession';
   }
   return attentionStatusBar;
+}
+
+/**
+ * 打开当前需要你关注的那个会话（状态栏按钮的落点）。
+ *
+ * 目标由 {@link AttentionWatcher.focusSessionId} 给出：**待确认优先于已完成**，
+ * 多个会话同时在等时取事件时间最新的那条——与按钮上显示的文字同一优先级。
+ *
+ * 跳转复用 `openSessionByJump`，与搜索结果、排行页标题走的是同一条候选链，
+ * 因此这里不需要认识任何 `kiroAgent.*` 命令。
+ */
+async function openAttentionSession(): Promise<void> {
+  const sessionId = attentionWatcher?.focusSessionId;
+  if (!sessionId) {
+    // 点下去时状态已经变了（在别处确认过、或标记刚被清）。用状态栏消息而不是弹窗：
+    // 这不是错误，没必要打断。
+    vscode.window.setStatusBarMessage('$(check) Kiro：已经没有待确认的会话了', 3000);
+    void attentionWatcher?.refresh();
+    return;
+  }
+
+  const title = attentionSessionTitle(sessionId);
+  logTurnTimer(`[待确认] 打开会话 ${sessionId}${title ? `（${title}）` : ''}`);
+  await openSessionByJump({ sessionId, title, sessionLayout: 'new' });
+}
+
+/**
+ * 取会话标题，用于跳转命令的第二个参数。
+ *
+ * 读 `session.json`；读不到就不传标题——`buildJumpCandidates` 允许省略它（Req 5.6），
+ * 没有标题也能跳，只是打开后的标签页文字由 Kiro 自己决定。
+ */
+function attentionSessionTitle(sessionId: string): string | undefined {
+  try {
+    const env = checkEnv();
+    const dir = env.ok && env.newWorkspaceDir ? env.newWorkspaceDir : null;
+    if (!dir) return undefined;
+    const meta = readNewSessionMeta(path.join(dir, sessionId));
+    const title = meta?.title;
+    return typeof title === 'string' && title.trim() ? title : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** 装配注入依赖：这里是本功能唯一接触 fs / vscode 配置的地方。 */
@@ -409,12 +455,17 @@ function buildAttentionDeps(): AttentionDeps {
         const first = pending[0].question || pending[0].interactionType || '等待确认';
         bar.text =
           pending.length > 1 ? `$(bell-dot) 待确认 ${pending.length}` : '$(bell-dot) 待确认';
-        bar.tooltip = pending.map((p) => '• ' + (p.question || p.toolCallId)).join('\n');
+        bar.tooltip = [
+          ...pending.map((p) => '• ' + (p.question || p.toolCallId)),
+          '',
+          pending.length > 1 ? '点击打开最近一个等待确认的会话' : '点击打开该会话',
+        ].join('\n');
         bar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
         bar.accessibilityInformation = { label: `Kiro 等待确认：${first}` };
       } else {
         bar.text = '$(check-all) 已完成';
-        bar.tooltip = 'Kiro 在你离开期间跑完了一轮；聚焦本窗口后此提示消失';
+        bar.tooltip =
+          'Kiro 在你离开期间跑完了一轮；聚焦本窗口后此提示消失\n\n点击打开刚跑完的那个会话';
         // 完成是好消息，不该用警告色去抢注意力
         bar.backgroundColor = undefined;
         bar.accessibilityInformation = { label: 'Kiro 已完成一轮' };
@@ -1634,6 +1685,14 @@ export function activate(context: vscode.ExtensionContext) {
   // 也是搜索面板过滤条右下角齿轮的落点（`openSettings` 消息执行的就是本命令）。
   context.subscriptions.push(
     vscode.commands.registerCommand('kiroChatSearch.settings', () => openSettingsPanel(context))
+  );
+
+  // 状态栏「待确认 / 已完成」按钮的落点：直接打开那个会话。
+  // 也注册进命令面板——键盘流用户不必去点状态栏。
+  context.subscriptions.push(
+    vscode.commands.registerCommand('kiroChatSearch.openAttentionSession', () =>
+      openAttentionSession()
+    )
   );
 
   // 诊断命令：只读探查能否旁听 kiro-agent 的遥测（用于取真实 token 数）。

@@ -47,6 +47,42 @@ export interface PendingInteraction {
   question: string;
   /** 事件时间（epoch ms）；时间戳缺失或非法时为 `null`。 */
   at: number | null;
+  /**
+   * 这条交互属于哪个会话（= NewSessionDir 的目录名，也就是跳转命令要的 sessionId）。
+   *
+   * **解析阶段拿不到**：`messages.jsonl` 的事件里没有会话身份，身份来自它所在的目录名。
+   * 因此 {@link scanPendingInteractions} 产出的项没有这个字段，由
+   * {@link AttentionWatcher} 在枚举目录时盖上——谁知道就由谁填，不在解析函数里假装知道。
+   */
+  sessionId?: string;
+}
+
+/**
+ * 取「最近一个」等待项：按事件时间最新的那条。
+ *
+ * 状态栏那个按钮点下去要打开**一个**会话，多个会话同时在等时得挑一个，挑最新的那条
+ * ——它最可能是用户刚才在等的。
+ *
+ * 时间戳可能缺失（`messages.jsonl` 是外部进程写的）：带时间戳的一律优先于不带的；
+ * 都不带时取**靠后**那条（文件里出现得更晚，即更近）。空数组返回 `null`。
+ */
+export function mostRecentPending(
+  items: readonly PendingInteraction[]
+): PendingInteraction | null {
+  let best: PendingInteraction | null = null;
+  for (const it of items) {
+    if (best === null) {
+      best = it;
+      continue;
+    }
+    if (it.at === null) {
+      // 没时间戳的只在「现任也没时间戳」时才顶掉现任
+      if (best.at === null) best = it;
+      continue;
+    }
+    if (best.at === null || it.at >= best.at) best = it;
+  }
+  return best;
 }
 
 /** 一次会话扫描的产出：谁在等确认，以及最后一次「轮结束」是哪一个。 */
@@ -276,6 +312,12 @@ export interface AttentionState {
   pending: readonly PendingInteraction[];
   /** 是否有「在你不看的时候跑完了一轮」尚未被你查看。 */
   done: boolean;
+  /**
+   * 刚跑完那一轮属于哪个会话（`done` 为真时才有意义）。
+   *
+   * 给状态栏那个按钮用：显示「已完成」时点一下应该能直接打开刚跑完的那个会话。
+   */
+  doneSessionId?: string;
 }
 
 /**
@@ -301,6 +343,8 @@ export class AttentionWatcher {
   private current: PendingInteraction[] = [];
   /** 是否有「你不在看的时候跑完的一轮」尚未被查看。 */
   private done = false;
+  /** 刚跑完那一轮属于哪个会话（供状态栏按钮跳转）。 */
+  private doneSession: string | undefined;
   /**
    * 我们当前写进标题的前缀（可能是 `''` / `doneMark` / `mark` / 两者拼接）。
    *
@@ -352,6 +396,23 @@ export class AttentionWatcher {
     return this.done;
   }
 
+  /** 刚跑完那一轮的会话 id（没有未查看的「已完成」时为 `undefined`）。 */
+  get doneSessionId(): string | undefined {
+    return this.done ? this.doneSession : undefined;
+  }
+
+  /**
+   * 状态栏按钮该打开哪个会话。
+   *
+   * 「待确认」优先于「已完成」——前者是卡着等你点，后者只是有结果了；按钮上显示的
+   * 也是同一个优先级，点击行为因此与文字一致。
+   */
+  get focusSessionId(): string | undefined {
+    const latest = mostRecentPending(this.current);
+    if (latest?.sessionId) return latest.sessionId;
+    return this.doneSessionId;
+  }
+
   /**
    * 窗口获得焦点：清掉「已完成」标记。
    *
@@ -361,6 +422,7 @@ export class AttentionWatcher {
   async onWindowFocused(): Promise<void> {
     if (!this.done) return;
     this.done = false;
+    this.doneSession = undefined;
     this.deps.log?.('[待确认] 窗口获得焦点，清除完成标记');
     this.deps.onStateChange({ pending: this.current, done: false });
     await this.syncTitle();
@@ -379,9 +441,15 @@ export class AttentionWatcher {
     // 「任一完成就亮」是刻意的语义——你关心的是「有东西跑完了，回来看看」，
     // 而不是「所有会话都停了」；后者在多会话下几乎永远等不到。
     let finished = false;
+    let finishedSession: string | undefined;
     if (this.baselined) {
-      for (const [file, id] of turnEnds) {
-        if (id !== null && this.lastTurnEnds.get(file) !== id) finished = true;
+      for (const [sessionId, id] of turnEnds) {
+        if (id !== null && this.lastTurnEnds.get(sessionId) !== id) {
+          finished = true;
+          // 同一轮扫描里多个会话都跑完时取遍历到的最后一个：这是个「打开哪一个」的
+          // 取舍而非正确性问题，且并发跑完多个会话本就少见
+          finishedSession = sessionId;
+        }
       }
     }
     this.lastTurnEnds = turnEnds;
@@ -390,7 +458,11 @@ export class AttentionWatcher {
     const wasDone = this.done;
     if (finished && !this.isFocused()) {
       this.done = true;
-      this.deps.log?.('[待确认] 有会话跑完了一轮，且窗口无焦点 → 亮完成标记');
+      this.doneSession = finishedSession;
+      this.deps.log?.(
+        '[待确认] 有会话跑完了一轮，且窗口无焦点 → 亮完成标记' +
+          (finishedSession ? `（${finishedSession}）` : '')
+      );
     }
 
     const pendingChanged = !sameIds(this.current, next);
@@ -402,7 +474,9 @@ export class AttentionWatcher {
       );
     }
     if (pendingChanged || this.done !== wasDone) {
-      this.deps.onStateChange({ pending: next, done: this.done });
+      const state: AttentionState = { pending: next, done: this.done };
+      if (this.doneSessionId) state.doneSessionId = this.doneSessionId;
+      this.deps.onStateChange(state);
     }
     await this.syncTitle();
   }
@@ -419,6 +493,7 @@ export class AttentionWatcher {
   async dispose(): Promise<void> {
     this.current = [];
     this.done = false;
+    this.doneSession = undefined;
     await this.syncTitle();
   }
 
@@ -455,7 +530,12 @@ export class AttentionWatcher {
     this.currentPrefix = '';
   }
 
-  /** 枚举工作区下每个会话的 MessagesFile 尾部，汇总等待项。 */
+  /**
+   * 枚举工作区下每个会话的 MessagesFile 尾部，汇总等待项。
+   *
+   * `turnEnds` 与等待项都按 **sessionId（= 目录名）** 记，而不是文件全路径：
+   * 会话身份是状态栏按钮要跳转的东西，在这里顺手带上，比事后从路径里反解更可靠。
+   */
   private collect(): {
     pending: PendingInteraction[];
     turnEnds: Map<string, string | null>;
@@ -473,11 +553,12 @@ export class AttentionWatcher {
       const raw = this.deps.readTail(file, TAIL_BYTES);
       if (raw === null) continue;
       const activity = scanSessionActivity(raw);
-      turnEnds.set(file, activity.lastTurnEndId);
+      turnEnds.set(name, activity.lastTurnEndId);
       for (const item of activity.pending) {
         if (seen.has(item.toolCallId)) continue;
         seen.add(item.toolCallId);
-        out.push(item);
+        // 会话身份只有这里知道（解析函数看不到目录名），在此盖上
+        out.push({ ...item, sessionId: name });
       }
     }
     return { pending: out, turnEnds };
