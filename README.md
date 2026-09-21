@@ -310,25 +310,62 @@ promise 了结掉，那个 requestId 的 `response`/`error` **永远不会到达
 
 ### 具体改了什么
 
+每个入口所在的 `dist` 下放一份注入脚本，每个入口的 `main.js` 末尾追加一行 import
+（追加前整份备份为 `main.js.kcs-orig`）：
+
 ```
-<Kiro>/resources/app/extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/
-  kcs-turn-timer.js          # 新增：注入的 ES module（内容 = 本仓库 media/kcs-turn-timer.js）
-  session-manager/main.js    # 末尾追加一行 import；追加前整份备份为 main.js.kcs-orig
-  session-view/main.js       # 同上
-  standalone/main.js         # 同上
+<Kiro>/resources/app/extensions/kiro.kiro-agent/packages/
+  kiro-ui-agent-chat/dist/
+    kcs-turn-timer.js              # 新增（内容 = 本仓库 media/kcs-turn-timer.js）
+    standalone/main.js             # 独立对话窗口
+    session-manager/main.js        # 1.0.x 的侧边栏；1.1.x 起只在独立窗口模式下用
+    session-view/main.js           # 1.0.x 的编辑器分栏
+  kiro-ui-session-details/dist/
+    kcs-turn-timer.js              # 同一份脚本的另一个副本（import 是相对路径，无法共用）
+    session-manager-surface/main.js  # 1.1.x 起的侧边栏对话面板
+    session-surface/main.js          # 1.1.x 起的编辑器分栏单会话面板
 ```
 
-三个入口对应三个界面，都要打：
+### 入口清单为什么必须动态发现
 
-| 入口 | 界面 | 视图 / 来源 |
-| --- | --- | --- |
-| `session-manager` | **侧边栏**对话面板（日常用得最多） | `kiroAgent.chatView` |
-| `session-view` | 编辑器分栏里打开的单会话面板 | `buildEditorPanel` |
-| `standalone` | 独立对话窗口 | `kiroAgent.standaloneChatView` |
+这里踩过一次真实的坑，代价是功能**静默失效**了一整个版本。
 
-这点很容易搞错：`AgentChatViewProvider` 的 `entryPoint` **默认值**是 `session-view`，
-但侧边栏那个 provider 是显式用 `entryPoint:"session-manager"` 构造的。只打
-`session-view` 的话，编辑器分栏和独立窗口有效、而侧边栏毫无反应。
+早先的实现把目标写死成「`kiro-ui-agent-chat/dist` 下的 `session-manager` /
+`session-view` / `standalone`」。Kiro 1.1.14 新增了包 `kiro-ui-session-details`，
+把侧边栏与编辑器分栏的对话面板搬了过去：
+
+```js
+Q8 = ["packages","kiro-ui-agent-chat","dist"]        // 旧
+z8 = ["packages","kiro-ui-session-details","dist"]   // 新
+function bundleFor(t) {
+  let e = t === "session-surface" || t === "session-manager-surface",
+      r = e ? z8 : Q8;                                // ← 换包
+  return { buildOutput: { module: true, scriptPath: path.join(...r, t, "main.js"), … } };
+}
+```
+
+于是旧包那三个入口**依然被打得好好的**，探测也如实报告「已生效」——但用户日常用的面板
+根本不加载那个包。**状态说了真话，却是废话**：它只认自己知道的那一个目录，Kiro 换了地方
+它就自信地报告一切正常。这比直接报错更糟，因为它剥夺了用户发现问题的机会。
+
+现在分两步，缺一不可：
+
+1. **入口名从 Kiro 自己的 bundle 里认**（`dist/extension.js` 里 `entryPoint` 附近的字符串
+   字面量，四种写法都覆盖：默认参数 `entryPoint:r="session-view"`、显式构造、对象字面量、
+   `===` 比较）。它才是权威。正则刻意**宽松**——宁可多捞噪音，也不要漏掉真入口。
+2. **用文件系统确认**每个名字对应的目录在哪：一次遍历建一张「目录名 → 含 `main.js` 的目录」
+   索引，多捞的噪音在这一步自然被滤掉。
+
+不假设 `packages/<pkg>/dist/<entry>` 这个层级，只假设「入口是某个目录下的 `main.js`，
+注入脚本放在它的上一级」——而这正是 `import "../kcs-turn-timer.js"` 这个相对路径本身的
+含义。所以 Kiro 再把包挪到别处也依然能找到。
+
+**认不出清单时不假装正常**：退回内置清单，同时状态直接判为 `partial`，设置页那一行显示
+「无法确认是否生效：认不出 Kiro 当前用的对话面板入口」。这一档刻意与「只注入了一部分」
+分开——后者暗示「我知道该注入哪些、只是没弄完」，而此时的事实恰恰相反。
+
+还原也不靠清单：清理范围是「当前发现的入口」∪「**磁盘上任何带我们标记的入口**」。
+Kiro 换过入口名之后旧入口不再出现在发现结果里，只按清单还原会把改动永久留在那儿。
 
 入口文件是几百字节的 ESM loader，补丁只在末尾追加
 
@@ -834,7 +871,7 @@ src/
   storage/ranking.ts  # 占用排行页：取数 + 纯函数 + HTML + 面板生命周期
   storage/report.ts   # 存储占用分析报告的聚合与文本渲染（纯函数）
   storage/cleaner.ts  # SessionCleaner：清理会话数据，可写磁盘
-  turnTimer.ts        # TurnTimerPatch：探测 / 注入 / 还原对话面板补丁，唯一会写 Kiro 安装目录的模块
+  turnTimer.ts        # TurnTimerPatch：动态发现入口 + 探测 / 注入 / 还原，唯一会写 Kiro 安装目录的模块
   settings.ts         # 设置页：HTML（纯函数）+ 面板生命周期，注入宿主能力便于测试
   attention.ts        # PendingApproval：解析待确认事件 + 窗口标题标记（不 import vscode）
   webview/turnTimer.ts # 设置页状态行文案的纯函数（turnTimerStatusLabel）

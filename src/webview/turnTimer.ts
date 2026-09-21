@@ -24,6 +24,14 @@ export interface TurnTimerLabelInput {
   detail?: string;
   /** 本窗口启动后动过补丁文件 → 当前面板加载的是旧版本，需重载才一致。 */
   dirty?: boolean;
+  /**
+   * 入口清单已降级（没能从 Kiro 的 bundle 里认出它在用哪些对话面板入口）。
+   *
+   * 单独一档，不和「只注入了一部分」混在一起：那句话暗示「我知道该注入哪些、只是没弄完」，
+   * 而这里的事实恰恰相反——**我们不知道该注入哪些**。把这两件事说成同一句，
+   * 就是上一次「状态说已生效、功能实际失效」的翻版。
+   */
+  surveyDegraded?: boolean;
 }
 
 /** 状态行渲染所需的一切（设置页不做二次判断）。 */
@@ -56,6 +64,7 @@ export function turnTimerStatusLabel(input: TurnTimerLabelInput): TurnTimerLabel
   const state = (input && input.state) || 'unavailable';
   const detail = (input && input.detail) || '';
   const dirty = !!(input && input.dirty);
+  const degraded = !!(input && input.surveyDegraded);
 
   const withTitle = function (label: TurnTimerLabel): TurnTimerLabel {
     return {
@@ -89,6 +98,18 @@ export function turnTimerStatusLabel(input: TurnTimerLabelInput): TurnTimerLabel
       title: '',
       canRetry: false,
       canReload: true,
+    });
+  }
+
+  // 认不出 Kiro 在用哪些入口 ⇒ 无论磁盘上打了多少，都不能说「已生效」
+  if (degraded) {
+    return withTitle({
+      tone: 'error',
+      badge: '⚠',
+      text: '无法确认是否生效：认不出 Kiro 当前用的对话面板入口',
+      title: '',
+      canRetry: true,
+      canReload: false,
     });
   }
 

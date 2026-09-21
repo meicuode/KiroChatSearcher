@@ -97,8 +97,10 @@ interface SettingsStatusMessage {
   dirty: boolean;
   state: TurnTimerStatus['state'];
   detail: string;
-  distDir: string | null;
-  entries: TurnTimerStatus['entries'];
+  /** 逐包状态：Kiro 1.1.x 起对话面板分散在多个产物包里，只报一个目录说不清全貌。 */
+  bundles: TurnTimerStatus['bundles'];
+  /** 入口发现结果，含「清单已降级」这类必须让用户看见的告警。 */
+  survey: TurnTimerStatus['survey'];
   scriptInstalled: boolean;
   scriptUpToDate: boolean;
   /**
@@ -324,12 +326,12 @@ export class SettingsPanel {
       this.lastError = messageOf(e);
       status = {
         state: 'unavailable',
-        distDir: null,
+        bundles: [],
         scriptInstalled: false,
         scriptUpToDate: false,
-        entries: [],
         appliedAt: null,
         hostStartedAt: null,
+        survey: { source: 'fallback', discovered: [], bundles: [], unlocated: [] },
         detail: '探测失败：' + messageOf(e),
       };
     }
@@ -340,8 +342,8 @@ export class SettingsPanel {
       dirty: safeBool(() => this.deps.isDirty()),
       state: status.state,
       detail: status.detail,
-      distDir: status.distDir,
-      entries: status.entries,
+      bundles: status.bundles,
+      survey: status.survey,
       scriptInstalled: status.scriptInstalled,
       scriptUpToDate: status.scriptUpToDate,
       checkedAt: Date.now(),
@@ -933,23 +935,59 @@ export function getSettingsHtml(cspSource: string, nonce: string, version?: stri
     return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   }
 
-  /** 逐入口状态 + dist 路径：只在展开「技术细节」时才有人看，故做成纯文本。 */
+  /**
+   * 逐包、逐入口状态：只在展开「技术细节」时才有人看，故做成纯文本。
+   *
+   * 按**包**分组而不是平铺一串入口：Kiro 1.1.x 起对话面板分散在多个产物包里
+   * （侧边栏与编辑器分栏在一个包、独立窗口在另一个），平铺会让「哪个界面没生效」
+   * 完全看不出来——而那正是排查时唯一想知道的事。
+   */
   function techText(m) {
     const lines = [];
-    lines.push('对话面板目录：' + (m.distDir || '（未找到）'));
-    lines.push('注入脚本：' + (m.scriptInstalled ? (m.scriptUpToDate ? '已安装（版本一致）' : '已安装（版本不一致）') : '未安装'));
-    const entries = Array.isArray(m.entries) ? m.entries : [];
-    if (!entries.length) {
-      lines.push('入口：（未找到任何入口文件）');
+    const survey = m.survey || {};
+
+    lines.push(
+      '入口清单来源：' +
+        (survey.source === 'kiro'
+          ? '从 Kiro 的 bundle 里认出（权威）'
+          : '⚠ 已降级为扩展内置清单' + (survey.reason ? '（' + survey.reason + '）' : ''))
+    );
+
+    const bundles = Array.isArray(m.bundles) ? m.bundles : [];
+    if (!bundles.length) {
+      lines.push('产物包：（未找到任何可注入的入口）');
     } else {
-      entries.forEach(function (e) {
-        const bits = [];
-        bits.push(e.present ? '存在' : '不存在');
-        if (e.present) bits.push(e.patched ? '已注入' : '未注入');
-        if (e.backedUp) bits.push('有备份');
-        lines.push('入口 ' + e.entry + '：' + bits.join(' · '));
+      bundles.forEach(function (b) {
+        lines.push('');
+        lines.push('产物包 ' + b.label);
+        lines.push(
+          '  注入脚本：' +
+            (b.scriptInstalled
+              ? b.scriptUpToDate
+                ? '已安装（版本一致）'
+                : '已安装（版本不一致）'
+              : '未安装')
+        );
+        const entries = Array.isArray(b.entries) ? b.entries : [];
+        entries.forEach(function (e) {
+          const bits = [];
+          bits.push(e.present ? '存在' : '不存在');
+          if (e.present) bits.push(e.patched ? '已注入' : '未注入');
+          if (e.backedUp) bits.push('有备份');
+          lines.push('  入口 ' + e.entry + '：' + bits.join(' · '));
+        });
       });
     }
+
+    // 认出来但磁盘上定位不到的名字：宽松正则必然多捞噪音，所以只在技术细节里列，
+    // 不参与状态判定、也不弹告警——否则会天天误报
+    const unlocated = Array.isArray(survey.unlocated) ? survey.unlocated : [];
+    if (unlocated.length) {
+      lines.push('');
+      lines.push('认出但未定位到目录的名字（多为噪音，仅供排查）：' + unlocated.join('、'));
+    }
+
+    lines.push('');
     lines.push('状态判定：' + m.state);
     return lines.join('\\n');
   }
@@ -962,6 +1000,7 @@ export function getSettingsHtml(cspSource: string, nonce: string, version?: stri
       state: m.state,
       detail: m.detail,
       dirty: !!m.dirty,
+      surveyDegraded: !!(m.survey && m.survey.source === 'fallback'),
     });
 
     $statusLine.dataset.tone = label.tone;
