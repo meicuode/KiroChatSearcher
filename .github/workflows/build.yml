@@ -74,3 +74,23 @@ jobs:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: 'kiro-chat-search-*.vsix'
+
+      # 仅在 tag 触发时发布到 Open VSX（Kiro 的 extensionsGallery 指向 open-vsx.org，
+      # 发布后 Kiro 扩展面板就会原生显示「有可用更新」）。
+      #
+      # 发布的是上面**已经打好并已随 Release 分发的那个 vsix**，不重新打包：
+      # 保证市场上的字节与 Release 附件完全一致，不给「两处产物不同」留缝隙。
+      #
+      # 没配 OVSX_PAT 时跳过而不是失败：Release 已经建好了，不该因为可选的市场发布
+      # 把整次 tag 构建判成红的。跳过时下一步会显式告警，避免静默。
+      - name: Publish to Open VSX
+        id: ovsx
+        if: startsWith(github.ref, 'refs/tags/v') && env.OVSX_PAT != ''
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx ovsx publish "kiro-chat-search-${{ steps.pkg.outputs.version }}.vsix"
+
+      - name: Warn if Open VSX publishing was skipped
+        if: startsWith(github.ref, 'refs/tags/v') && steps.ovsx.outcome == 'skipped'
+        run: |
+          echo "::warning::未配置 OVSX_PAT，已跳过发布到 Open VSX。GitHub Release 已创建；如需市场更新，请在仓库 Secrets 里添加 OVSX_PAT。"

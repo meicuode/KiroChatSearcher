@@ -812,6 +812,20 @@ npx vsce package   # 打包成 .vsix
 
 调试：在 VSCode / Kiro 中按 `F5` 启动扩展开发宿主。打包生成的 `.vsix` 可直接拖入 Kiro 的扩展面板安装。
 
+## 安装与更新
+
+Kiro 的 `product.json` 把 `extensionsGallery` 指向 **Open VSX**（`https://open-vsx.org/vscode/gallery`），
+所以本扩展发布在那里，在 Kiro 扩展面板里搜 `Kiro Chat Search` 即可安装，后续由 Kiro
+**原生提示更新**（是否自动更新取决于 `extensions.autoUpdate`）。
+
+> **从早期本地安装迁移**：0.x–1.8.0 的 `publisher` 是 `local`，扩展 id 为
+> `local.kiro-chat-search`；发布到市场后 id 变成 `meicuode.kiro-chat-search`。Kiro 会把
+> 两者视为不同扩展，因此请**先卸载 `local.kiro-chat-search`**（否则两份同时启用，
+> 状态栏、命令与对话面板补丁都会走两遍），再从市场安装。
+>
+> 补丁不受影响：`revertTurnTimer` 认的是文件里的标记而不是扩展 id，旧副本卸载时会正常
+> 还原，新副本装上后重新注入。
+
 ## 持续集成与自动发布（GitHub Actions）
 
 仓库内置 `.github/workflows/build.yml`，自动完成编译、测试与打包。
@@ -823,7 +837,7 @@ npx vsce package   # 打包成 .vsix
 | 触发事件 | 行为 | 产物 |
 | --- | --- | --- |
 | push 到 `main` / 发起 PR | `npm ci` → `compile` → `test` → `vsce package` | vsix 作为 **artifact** 上传（保留 30 天，可在 Actions 运行页面下载），**不创建 Release** |
-| push 形如 `v*` 的 tag（如 `v0.2.0`） | 上述全部 + 校验 tag 与 `package.json` 版本一致后创建 **GitHub Release** | Release 附带 vsix，自动生成 release notes |
+| push 形如 `v*` 的 tag（如 `v1.8.1`） | 上述全部 + 校验 tag 与 `package.json` 版本一致 → 创建 **GitHub Release** → 发布到 **Open VSX** | Release 附带 vsix；市场上线后 Kiro 原生提示更新 |
 
 > tag 版本与 `package.json` 的 `version` 不一致时 CI 会**直接报错**，强制两者同步，避免发布出版本号对不上的安装包。
 
@@ -843,7 +857,16 @@ git push origin v0.3.0
 **说明**：
 
 - Release 用 `softprops/action-gh-release` 创建，依赖 GitHub 自动注入的 `GITHUB_TOKEN`（workflow 已声明 `permissions: contents: write`），**无需手动配置任何 secret**。
-- 当前仅面向本地 / GitHub 分发，未发布到 VS Code Marketplace 或 Open VSX；若需发布到市场，需额外配置对应的发布 token。
+- 市场发布用 `ovsx publish <已打好的那个 vsix>`，**不重新打包** —— 保证市场上的字节与 Release 附件完全一致，不给「两处产物不同」留缝隙。
+- 需要仓库 Secret `OVSX_PAT`（Open VSX 个人访问令牌）。**没配就跳过而不是失败**：Release 已经建好了，不该因为可选的市场发布把整次 tag 构建判成红的；跳过时会打一条 `::warning::`，不静默。
+
+### 为什么不用 Trusted Publishing
+
+`ovsx` 的 CLI 文档（master）介绍了用 GitHub Actions 的 OIDC ID token 换短期令牌、
+从而**不必保存长期 PAT** 的做法。但 open-vsx.org 当前部署的注册表版本是
+`v1.1.2`（见 `https://open-vsx.org/api/version`），**还没有这个功能** ——
+`user-settings/trusted-publishers` 页面因此是空的。等公共实例升级后可以切过去，
+届时删掉 `OVSX_PAT` 这个 secret 即可。
 - 平时若只想拿某次提交的安装包，无需打 tag：到仓库 **Actions** 页面对应运行记录的 **Artifacts** 区下载即可。
 
 ## 项目结构
@@ -878,6 +901,10 @@ src/
   webview/marks.ts    # 提醒标记的归一化与标题预览（normalizeMark / markPreview，宿主与设置页共用）
 media/
   kcs-turn-timer.js   # 注入进 Kiro 对话面板 webview 的脚本（随扩展分发）；由 tests/turnTimer.script.spec.ts 直接驱动
+  icon.svg            # 活动栏图标（必须单色，VSCode 会重新着色）
+  icon-128.png        # 市场图标（256×256 彩色版）；由 scripts/generate-icon.ps1 生成
+scripts/
+  generate-icon.ps1   # 用 GDI+ 画市场图标（不随扩展分发）；让提交进仓库的二进制产物可复现
   telemetryTap.ts     # 只读诊断：进程边界与 OTel 全局注册表探查（取真实 token 的可行性）
 tests/                # vitest 单元测试与 fast-check 属性测试
 docs/
